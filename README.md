@@ -56,6 +56,7 @@ plugins:
     mimo-cliproxyapi:
       enabled: true
       priority: 1
+      region: cn                # cn | sgp | ams — Token Plan cluster
       # base_url: "https://api.xiaomimimo.com/v1"
       # token_plan_base_url: "https://token-plan-cn.xiaomimimo.com/v1"
       # request_timeout_seconds: 300
@@ -65,6 +66,9 @@ plugins:
       #     context_length: 1048576
       #     max_completion_tokens: 131072
 ```
+
+These fields, plus `enabled` and `priority`, render as a form in the Management Center plugin page;
+saving them goes through `PUT/PATCH /v0/management/plugins/mimo-cliproxyapi/config`.
 
 Then add one credential per API key (pay-as-you-go and token plan keys can coexist: CPA pools
 them and `auths` selection picks per request):
@@ -76,6 +80,25 @@ them and `auths` selection picks per request):
 Drop it in the auth directory (`auth-dir`, default `~/.cli-proxy-api`) as `mimo-sk-1.json`, or
 POST it to `/v0/management/auth-files`. Models are then reachable as `mimo-v2.6-pro` and friends
 from any client protocol CPA already serves.
+
+## Management Center panel
+
+The plugin registers one browser resource and two API routes:
+
+| route | what it does |
+| --- | --- |
+| `/status` (resource, menu "MiMo Provider") | the panel shell; the management center links it from the sidebar |
+| `GET /v0/management/plugins/mimo-cliproxyapi/state` | JSON: config, catalog, credential list, counters |
+| `POST /v0/management/plugins/mimo-cliproxyapi/probe` | one 16-token request with `{"auth_index":"..."}` to verify a credential |
+
+The panel shows the effective region and base URLs, every MiMo credential with its kind
+(`pay-as-you-go`, `token-plan`, `token-plan-team`), status, request/error counters and the last
+status, plus a per-credential probe button reporting HTTP status and latency. Credential kinds and
+counters come from what the executor observed; no key material is stored or displayed.
+
+Resource responses are not management-authenticated, so the shell carries no data: it reads the
+management key from the panel's own storage when it runs inside the management center, or asks for
+one and keeps it in `sessionStorage`.
 
 ## Develop
 
@@ -99,15 +122,17 @@ plugin store registry.
 2. Serve the Anthropic messages route natively for Claude Code, instead of round-tripping through
    CPA's translator.
 3. Serve the Responses API route for Codex.
-4. Quota view for Token Plan credits through the Management API.
+4. Token Plan credit balance in the panel, once Xiaomi publishes a usage endpoint (the console
+   shows usage; no documented API yet).
 5. Audio routes (ASR/TTS) once CPA exposes them to plugins.
 
 ## 中文速览
 
 小米 MiMo 平台的 CLIProxyAPI provider 插件，注册 `mimo` provider，走 OpenAI 兼容的 Chat
 Completions。普通 API 用 `sk-` key + `api.xiaomimimo.com/v1`，Token Plan（编码订阅）用 `tp-`/`ttp-`
-key + `token-plan-cn|sgp|ams.xiaomimimo.com/v1`，两种 key 不通用，插件按前缀自动选域名，也可用配置覆盖。
+key + `token-plan-<cn|sgp|ams>.xiaomimimo.com/v1`（用 `region` 选集群），两种 key 不通用。
 默认模型目录是 v2.6 系列（pro / flash / pro-ultraspeed，1M 上下文、128K 输出）；v2.5 系列 2026-10-21 下线。
+管理面板侧边栏会有 “MiMo Provider” 菜单：看每条凭据的类型/状态/请求计数，并能一键测速。
 
 ## License
 

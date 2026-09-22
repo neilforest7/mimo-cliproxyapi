@@ -21,6 +21,8 @@ type HostClient interface {
 	CloseStream(streamID string) error
 	EmitChunk(streamID string, payload []byte) error
 	CloseDownstreamStream(streamID string, errMsg string) error
+	AuthList(ctx context.Context) ([]pluginapi.HostAuthFileEntry, error)
+	AuthGetJSON(ctx context.Context, authIndex string) (json.RawMessage, error)
 	Log(level string, message string)
 }
 
@@ -154,6 +156,38 @@ func (b *HostBridge) CloseDownstreamStream(streamID string, errMsg string) error
 	}
 	_, err := b.invoke(context.Background(), pluginabi.MethodHostStreamClose, hostCloseDownstreamRequest{StreamID: streamID, Error: errMsg})
 	return err
+}
+
+// AuthList lists the credentials the host knows about, across every provider.
+func (b *HostBridge) AuthList(ctx context.Context) ([]pluginapi.HostAuthFileEntry, error) {
+	result, err := b.invoke(ctx, pluginabi.MethodHostAuthList, struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		Files []pluginapi.HostAuthFileEntry `json:"files"`
+	}
+	if len(result) > 0 {
+		if errUnmarshal := json.Unmarshal(result, &response); errUnmarshal != nil {
+			return nil, fmt.Errorf("host auth list returned an undecodable body")
+		}
+	}
+	return response.Files, nil
+}
+
+// AuthGetJSON reads one credential record. Callers must never log the payload.
+func (b *HostBridge) AuthGetJSON(ctx context.Context, authIndex string) (json.RawMessage, error) {
+	result, err := b.invoke(ctx, pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
+	if err != nil {
+		return nil, err
+	}
+	var response pluginapi.HostAuthGetResponse
+	if len(result) > 0 {
+		if errUnmarshal := json.Unmarshal(result, &response); errUnmarshal != nil {
+			return nil, fmt.Errorf("host auth get returned an undecodable body")
+		}
+	}
+	return response.JSON, nil
 }
 
 // Log forwards one diagnostic line. Messages never carry credentials or prompts.

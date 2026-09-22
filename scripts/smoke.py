@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ID = "mimo-cliproxyapi"
 PROVIDER = "mimo"
+BASE_PATH = "/v0/management/plugins/" + PLUGIN_ID
 SMOKE_VERSION = "0.0.0-smoke"
 EXT = {"Darwin": "dylib", "Linux": "so", "Windows": "dll"}[platform.system()]
 
@@ -96,6 +97,15 @@ class FakeHost:
         if method == "host.http.stream_close":
             self.closed_upstream.append(payload.get("stream_id", ""))
             return {}
+        if method == "host.auth.list":
+            return {
+                "files": [
+                    {"auth_index": "a1", "name": "mimo-sk-smoke.json", "provider": PROVIDER, "type": PROVIDER, "status": "ready"},
+                    {"auth_index": "z9", "name": "other.json", "provider": "opencode-go", "type": "opencode-go"},
+                ]
+            }
+        if method == "host.auth.get":
+            return {"auth_index": payload.get("auth_index", ""), "json": {"type": PROVIDER, "api_key": "sk-smoke"}}
         if method == "host.stream.emit":
             self.emitted.append(base64.b64decode(payload["payload"]))
             return {}
@@ -217,6 +227,7 @@ def main() -> int:
             "executor.execute",
             {
                 "Model": "mimo-v2.6-pro",
+                "AuthID": "a1",
                 "AuthAttributes": {"api_key": "sk-smoke"},
                 "Payload": base64.b64encode(b'{"model":"mimo-v2.6-pro","messages":[]}').decode(),
             },
@@ -233,7 +244,7 @@ def main() -> int:
         host.status = 429
         failed = call(
             "executor.execute",
-            {"Model": "mimo-v2.6-pro", "AuthAttributes": {"api_key": "sk-smoke"}, "Payload": base64.b64encode(b"{}").decode()},
+            {"Model": "mimo-v2.6-pro", "AuthID": "a1", "AuthAttributes": {"api_key": "sk-smoke"}, "Payload": base64.b64encode(b"{}").decode()},
         )
         if failed.get("error", {}).get("http_status") != 429:
             print(f"upstream 429 not surfaced: {failed}", file=sys.stderr)
@@ -246,6 +257,7 @@ def main() -> int:
             "executor.execute_stream",
             {
                 "Model": "mimo-v2.6-pro",
+                "AuthID": "a2",
                 "AuthAttributes": {"api_key": "tp-smoke"},
                 "Payload": base64.b64encode(b'{"model":"mimo-v2.6-pro","stream":true}').decode(),
                 "stream_id": "downstream-1",
@@ -263,6 +275,62 @@ def main() -> int:
             return 1
         if host.closed_downstream != ["downstream-1"] or host.closed_upstream != ["upstream-1"]:
             print(f"streams not closed: {host.closed_downstream} {host.closed_upstream}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        registered = call("management.register", {"BasePath": BASE_PATH, "ResourceBasePath": "/v0/resource/plugins/" + PLUGIN_ID})
+        resources = registered.get("Resources") or []
+        if not resources or resources[0]["Path"] != "/status" or resources[0]["Menu"] != "MiMo Provider":
+            print(f"unexpected management resources: {resources}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        def decode(body: bytes, label: str) -> dict:
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError as err:
+                print(f"{label} returned invalid JSON ({err}): {body[:200]!r}", file=sys.stderr)
+                raise SystemExit(1) from err
+
+        def manage(method: str, path: str, body: bytes | None = None) -> tuple[int, bytes]:
+            result = call(
+                "management.handle",
+                {"Method": method, "Path": path, "Body": base64.b64encode(body).decode() if body else ""},
+            )
+            try:
+                return int(result["StatusCode"]), base64.b64decode(result.get("Body") or "")
+            except (KeyError, TypeError, ValueError) as err:
+                print(f"management.handle({method} {path}) unusable ({err}): {result}", file=sys.stderr)
+                raise SystemExit(1) from err
+
+        status, body = manage("GET", "/v0/resource/plugins/" + PLUGIN_ID + "/status")
+        if status != 200 or b"MiMo Provider" not in body or b"__MANAGEMENT_BASE__" in body:
+            print(f"panel shell looks wrong ({status}): {body[:120]!r}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        status, body = manage("GET", BASE_PATH + "/state")
+        state = decode(body, "state")
+        if status != 200 or state["provider"] != PROVIDER:
+            print(f"state is wrong: {state}", file=sys.stderr)
+            return 1
+        rows = {row["auth_index"]: row for row in state["credentials"]}
+        primary, runtime_only = rows.get("a1"), rows.get("a2")
+        if not primary or primary["kind"] != "pay-as-you-go" or primary["requests"] < 1:
+            print(f"credential counters not reported: {state['credentials']}", file=sys.stderr)
+            return 1
+        if not runtime_only or runtime_only["kind"] != "token-plan":
+            print(f"runtime-only credential missing: {state['credentials']}", file=sys.stderr)
+            return 1
+        if state["totals"]["requests"] < 2 or state["totals"]["errors"] < 1:
+            print(f"totals not reported: {state['totals']}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        status, body = manage("POST", BASE_PATH + "/probe", json.dumps({"auth_index": "a1"}).encode())
+        probe = decode(body, "probe")
+        if status != 200 or not probe.get("ok") or probe.get("url") != PAY_AS_YOU_GO_URL:
+            print(f"probe failed: {probe}", file=sys.stderr)
             return 1
         checks += 1
 

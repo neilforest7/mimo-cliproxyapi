@@ -30,6 +30,10 @@ type fakeHost struct {
 	closedUpstream   []string
 	closedDownstream []string
 	logs             []string
+
+	authEntries []pluginapi.HostAuthFileEntry
+	authJSON    map[string]json.RawMessage
+	authListErr error
 }
 
 func (f *fakeHost) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {

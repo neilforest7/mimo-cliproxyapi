@@ -42,6 +42,7 @@ func executeRequest(raw []byte) ([]byte, error) {
 	if host == nil {
 		return errorEnvelope("plugin_error", "host callbacks are unavailable"), nil
 	}
+	recordRequest(req.AuthID, apiKey)
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout())
 	defer cancel()
 	response, err := host.Do(ctx, pluginapi.HTTPRequest{
@@ -51,11 +52,14 @@ func executeRequest(raw []byte) ([]byte, error) {
 		Body:    body,
 	})
 	if err != nil {
+		recordResult(req.AuthID, http.StatusBadGateway, err.Error())
 		return errorEnvelopeStatus("upstream_unreachable", err.Error(), http.StatusBadGateway), nil
 	}
 	if response.StatusCode >= 400 {
+		recordResult(req.AuthID, response.StatusCode, upstreamErrorMessage(response.Body))
 		return upstreamErrorEnvelope(response.StatusCode, response.Body), nil
 	}
+	recordResult(req.AuthID, response.StatusCode, "")
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: response.Body, Headers: response.Headers})
 }
 
@@ -76,6 +80,7 @@ func executeStreamRequest(raw []byte) ([]byte, error) {
 	if host == nil {
 		return errorEnvelope("plugin_error", "host callbacks are unavailable"), nil
 	}
+	recordRequest(req.AuthID, apiKey)
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout())
 	defer cancel()
 	start, err := host.OpenStream(ctx, pluginapi.HTTPRequest{
@@ -85,14 +90,17 @@ func executeStreamRequest(raw []byte) ([]byte, error) {
 		Body:    body,
 	})
 	if err != nil {
+		recordResult(req.AuthID, http.StatusBadGateway, err.Error())
 		return errorEnvelopeStatus("upstream_unreachable", err.Error(), http.StatusBadGateway), nil
 	}
 	if start.StatusCode >= 400 {
 		// The failed response body is only reachable through the stream handle.
 		message := drainStream(host, start.StreamID)
 		_ = host.CloseStream(start.StreamID)
+		recordResult(req.AuthID, start.StatusCode, message)
 		return upstreamErrorEnvelope(start.StatusCode, []byte(message)), nil
 	}
+	recordResult(req.AuthID, start.StatusCode, "")
 	if strings.TrimSpace(start.StreamID) == "" {
 		return errorEnvelopeStatus("upstream_error", "upstream stream has no handle", http.StatusBadGateway), nil
 	}

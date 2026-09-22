@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MiMo Provider</title>
+  <style>/*__INLINE_CSS__*/</style>
+</head>
+<body>
+  <main class="shell">
+    <header class="page-header">
+      <div>
+        <div class="eyebrow"><span class="dot" id="healthDot"></span><span id="healthLabel">读取状态中</span></div>
+        <h1>MiMo Provider</h1>
+        <p class="subtitle">小米 MiMo 凭据、路由与请求计数 · 版本 <span id="version">__PLUGIN_VERSION__</span></p>
+      </div>
+      <div class="header-actions">
+        <button class="btn" id="reload" type="button">刷新</button>
+      </div>
+    </header>
+
+    <section class="card auth-card" id="authCard">
+      <label for="keyInput">管理密钥（Management Key）</label>
+      <div class="row">
+        <input id="keyInput" type="password" placeholder="从管理面板配置里复制，或留空自动读取" autocomplete="off">
+        <button class="btn primary" id="saveKey" type="button">使用</button>
+      </div>
+      <p class="hint" id="authHint"></p>
+    </section>
+
+    <section class="grid" id="summary">
+      <div class="card stat"><span class="stat-label">请求总数</span><strong id="totalRequests">–</strong></div>
+      <div class="card stat"><span class="stat-label">失败数</span><strong id="totalErrors">–</strong></div>
+      <div class="card stat"><span class="stat-label">Token Plan 集群</span><strong id="region">–</strong></div>
+      <div class="card stat"><span class="stat-label">凭据数</span><strong id="credentialCount">–</strong></div>
+    </section>
+
+    <section class="card">
+      <h2>路由配置</h2>
+      <dl class="kv" id="configList"></dl>
+      <p class="hint">Region 与两个 Base URL 都能在插件配置里改，改完自动生效；Token Plan 键（tp- / ttp-）走集群域名，sk- 键走按量域名。</p>
+    </section>
+
+    <section class="card">
+      <h2>凭据</h2>
+      <table class="table" id="credentials">
+        <thead>
+          <tr><th>#</th><th>凭据</th><th>类型</th><th>状态</th><th>请求 / 失败</th><th>最近</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint" id="credentialsHint"></p>
+    </section>
+
+    <section class="card">
+      <h2>模型目录</h2>
+      <table class="table" id="catalog">
+        <thead><tr><th>模型</th><th>上下文</th><th>最大输出</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint">目录可在插件配置的 <code>models</code> 字段覆盖（JSON 数组）。</p>
+    </section>
+  </main>
+
+  <script>
+    const BASE = "__MANAGEMENT_BASE__";
+    const KEY_STORAGE = "mimo-provider-management-key";
+    let key = "";
+
+    function readPanelKey() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem("cli-proxy-auth") || "null");
+        const state = parsed && parsed.state ? parsed.state : parsed;
+        const value = state && state.managementKey;
+        if (typeof value === "string" && value.trim()) return value.trim();
+      } catch (_) {}
+      try {
+        const stored = sessionStorage.getItem(KEY_STORAGE);
+        if (stored) return stored.trim();
+      } catch (_) {}
+      return "";
+    }
+
+    async function api(path, options) {
+      const opts = options || {};
+      opts.headers = Object.assign({ Authorization: "Bearer " + key }, opts.headers || {});
+      const response = await fetch(BASE + path, opts);
+      const payload = await response.json().catch(function () { return { error: "响应不是 JSON" }; });
+      if (!response.ok) throw new Error(payload.error || ("HTTP " + response.status));
+      return payload;
+    }
+
+    function element(tag, className, value) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (value !== undefined) node.textContent = value;
+      return node;
+    }
+
+    function text(id, value) {
+      const node = document.getElementById(id);
+      if (node) node.textContent = value;
+    }
+
+    function formatNumber(value) {
+      return typeof value === "number" ? value.toLocaleString() : "–";
+    }
+
+    function addDefinition(list, label, value) {
+      list.appendChild(element("dt", "", label));
+      list.appendChild(element("dd", "", value || "默认"));
+    }
+
+    function kindLabel(kind) {
+      if (kind === "token-plan") return "Token Plan";
+      if (kind === "token-plan-team") return "Token Plan (团队)";
+      if (kind === "pay-as-you-go") return "按量计费";
+      return "未使用";
+    }
+
+    function statusText(row) {
+      if (row.disabled) return "已停用";
+      if (row.unavailable) return "不可用";
+      if (row.last_status >= 400) return "HTTP " + row.last_status;
+      if (row.requests > 0) return "正常";
+      return row.status || "待命";
+    }
+
+    function statusClass(row) {
+      if (row.disabled || row.unavailable || row.last_status >= 400) return "bad";
+      if (row.requests === 0) return "idle";
+      return "ok";
+    }
+
+    function credentialRow(row, index) {
+      const tr = document.createElement("tr");
+      tr.appendChild(element("td", "mono", String(index + 1)));
+
+      const nameCell = document.createElement("td");
+      nameCell.appendChild(element("div", "mono", row.name || row.auth_index));
+      if (row.label) nameCell.appendChild(element("div", "hint", row.label));
+      tr.appendChild(nameCell);
+
+      const kindCell = document.createElement("td");
+      kindCell.appendChild(element("span", "badge", kindLabel(row.kind)));
+      tr.appendChild(kindCell);
+
+      const statusCell = document.createElement("td");
+      statusCell.appendChild(element("span", "badge " + statusClass(row), statusText(row)));
+      tr.appendChild(statusCell);
+
+      tr.appendChild(element("td", "mono", formatNumber(row.requests) + " / " + formatNumber(row.errors)));
+      tr.appendChild(element("td", "mono", row.last_used ? row.last_used.replace("T", " ").replace("Z", "") : "–"));
+
+      const actionCell = document.createElement("td");
+      const button = element("button", "btn small", "测速");
+      button.type = "button";
+      button.addEventListener("click", function () { probe(row.auth_index, button); });
+      if (row.last_error) button.title = row.last_error;
+      actionCell.appendChild(button);
+      tr.appendChild(actionCell);
+      return tr;
+    }
+
+    function catalogRow(model) {
+      const tr = document.createElement("tr");
+      tr.appendChild(element("td", "mono", model.id));
+      tr.appendChild(element("td", "mono", formatNumber(model.context_length)));
+      tr.appendChild(element("td", "mono", formatNumber(model.max_completion_tokens)));
+      return tr;
+    }
+
+    function renderState(state) {
+      text("version", state.version);
+      text("totalRequests", formatNumber(state.totals.requests));
+      text("totalErrors", formatNumber(state.totals.errors));
+      text("region", state.region);
+      text("credentialCount", String(state.credentials.length));
+
+      const healthy = state.credentials.some(function (row) { return !row.disabled && !row.unavailable; });
+      document.getElementById("healthDot").className = "dot " + (healthy ? "ok" : "warn");
+      text("healthLabel", healthy ? "已就绪" : "没有可用凭据");
+
+      const configList = document.getElementById("configList");
+      configList.textContent = "";
+      addDefinition(configList, "region", state.config.region);
+      addDefinition(configList, "base_url", state.config.base_url);
+      addDefinition(configList, "token_plan_base_url", state.config.token_plan_base_url);
+      addDefinition(configList, "request_timeout_seconds", String(state.config.request_timeout_seconds));
+
+      const credentialsBody = document.querySelector("#credentials tbody");
+      credentialsBody.textContent = "";
+      state.credentials.forEach(function (row, index) {
+        credentialsBody.appendChild(credentialRow(row, index));
+      });
+      text("credentialsHint", state.credentials_error
+        ? "凭据列表读取失败：" + state.credentials_error
+        : (state.credentials.length ? "" : "还没有 MiMo 凭据：在管理面板的 Auth Files 里上传 {\"type\":\"mimo\",\"api_key\":\"sk-...\"}。"));
+
+      const catalogBody = document.querySelector("#catalog tbody");
+      catalogBody.textContent = "";
+      state.catalog.forEach(function (model) {
+        catalogBody.appendChild(catalogRow(model));
+      });
+    }
+
+    async function probe(authIndex, button) {
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = "请求中";
+      try {
+        const result = await api("/probe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auth_index: authIndex }),
+        });
+        button.textContent = (result.ok ? "✅ " : "❌ ") + (result.latency_ms || 0) + "ms";
+        if (result.error) button.title = result.error;
+      } catch (err) {
+        button.textContent = "失败";
+        button.title = err.message;
+      }
+      setTimeout(function () { button.disabled = false; button.textContent = original; }, 6000);
+    }
+
+    async function refresh() {
+      try {
+        renderState(await api("/state"));
+        text("authHint", "");
+        document.getElementById("authCard").classList.add("hidden");
+      } catch (err) {
+        document.getElementById("authCard").classList.remove("hidden");
+        text("authHint", "需要管理密钥才能读取状态（" + err.message + "）。");
+      }
+    }
+
+    document.getElementById("saveKey").addEventListener("click", function () {
+      const value = document.getElementById("keyInput").value.trim();
+      if (!value) return;
+      key = value;
+      try { sessionStorage.setItem(KEY_STORAGE, value); } catch (_) {}
+      refresh();
+    });
+    document.getElementById("reload").addEventListener("click", refresh);
+
+    key = readPanelKey();
+    refresh();
+  </script>
+</body>
+</html>

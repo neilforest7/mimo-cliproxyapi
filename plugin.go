@@ -29,22 +29,29 @@ const (
 	name       = "MiMo Provider"
 	author     = "neilforest7"
 	repository = "https://github.com/neilforest7/mimo-cliproxyapi"
+	logoURL    = "https://raw.githubusercontent.com/neilforest7/mimo-cliproxyapi/main/web/logo.svg"
 
 	// MiMo serves an OpenAI-compatible Chat Completions endpoint joined onto the base URL.
 	formatChatCompletions = "chat-completions"
 	chatCompletionsPath   = "/chat/completions"
 
 	payAsYouGoBaseURL = "https://api.xiaomimimo.com/v1"
-	// Subscription (Token Plan) credentials use their own cluster hosts. Default is the
-	// China cluster; Singapore and Amsterdam are documented in the README.
-	tokenPlanBaseURL = "https://token-plan-cn.xiaomimimo.com/v1"
+	// Token Plan (coding plan) credentials use their own cluster hosts.
+	tokenPlanHostCN  = "https://token-plan-cn.xiaomimimo.com/v1"
+	tokenPlanHostSGP = "https://token-plan-sgp.xiaomimimo.com/v1"
+	tokenPlanHostAMS = "https://token-plan-ams.xiaomimimo.com/v1"
+	defaultRegion    = "cn"
+	tokenPlanBaseURL = tokenPlanHostCN
+
+	tokenPlanKeyPrefix  = "tp-"
+	tokenPlanTeamPrefix = "ttp-"
 
 	defaultRequestTimeoutSeconds = 300
 )
 
 // tokenPlanKeyPrefixes are the credential prefixes issued by Token Plan subscriptions:
 // individual seats use tp-, team seats use ttp-.
-var tokenPlanKeyPrefixes = []string{"tp-", "ttp-"}
+var tokenPlanKeyPrefixes = []string{tokenPlanKeyPrefix, tokenPlanTeamPrefix}
 
 // state holds the configuration and host bridge pushed by plugin.register/init.
 var state = struct {
@@ -108,6 +115,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return executeStreamRequest(request)
 	case pluginabi.MethodExecutorCountTokens:
 		return countTokensRequest(request)
+	case pluginabi.MethodManagementRegister:
+		return managementRegister(request)
+	case pluginabi.MethodManagementHandle:
+		return managementHandle(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -128,6 +139,7 @@ type registrationCapabilities struct {
 	ModelProvider         bool                         `json:"model_provider"`
 	AuthProvider          bool                         `json:"auth_provider"`
 	Executor              bool                         `json:"executor"`
+	ManagementAPI         bool                         `json:"management_api"`
 	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
 	ExecutorInputFormats  []string                     `json:"executor_input_formats"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats"`
@@ -141,7 +153,14 @@ func pluginRegistration() registration {
 			Version:          pluginVersion,
 			Author:           author,
 			GitHubRepository: repository,
+			Logo:             logoURL,
 			ConfigFields: []pluginapi.ConfigField{
+				{
+					Name:        "region",
+					Type:        pluginapi.ConfigFieldTypeEnum,
+					EnumValues:  []string{"cn", "sgp", "ams"},
+					Description: "Token Plan cluster: cn (default), sgp, ams.",
+				},
 				{
 					Name:        "base_url",
 					Type:        pluginapi.ConfigFieldTypeString,
@@ -150,7 +169,7 @@ func pluginRegistration() registration {
 				{
 					Name:        "token_plan_base_url",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Base URL for Token Plan keys (tp-/ttp-). Default " + tokenPlanBaseURL,
+					Description: "Overrides the Token Plan cluster host for tp-/ttp- keys.",
 				},
 				{
 					Name:        "request_timeout_seconds",
@@ -168,6 +187,7 @@ func pluginRegistration() registration {
 			ModelProvider:         true,
 			AuthProvider:          true,
 			Executor:              true,
+			ManagementAPI:         true,
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeStatic,
 			ExecutorInputFormats:  []string{formatChatCompletions},
 			ExecutorOutputFormats: []string{formatChatCompletions},
@@ -184,6 +204,7 @@ type modelEntry struct {
 }
 
 type pluginConfig struct {
+	Region                string       `yaml:"region"`
 	BaseURL               string       `yaml:"base_url"`
 	TokenPlanBaseURL      string       `yaml:"token_plan_base_url"`
 	RequestTimeoutSeconds int          `yaml:"request_timeout_seconds"`
@@ -220,6 +241,18 @@ func currentConfig() pluginConfig {
 	return state.cfg
 }
 
+// tokenPlanHostForRegion maps the region setting onto a Token Plan cluster.
+func tokenPlanHostForRegion(region string) string {
+	switch strings.ToLower(strings.TrimSpace(region)) {
+	case "sgp", "sg", "singapore":
+		return tokenPlanHostSGP
+	case "ams", "eu", "europe", "amsterdam":
+		return tokenPlanHostAMS
+	default:
+		return tokenPlanHostCN
+	}
+}
+
 func isTokenPlanKey(apiKey string) bool {
 	key := strings.TrimSpace(apiKey)
 	for _, prefix := range tokenPlanKeyPrefixes {
@@ -230,20 +263,19 @@ func isTokenPlanKey(apiKey string) bool {
 	return false
 }
 
-// baseURLForCredential resolves the upstream base URL: an explicit base_url wins,
-// otherwise a Token Plan key uses the Token Plan host.
+// baseURLForCredential resolves the upstream base URL: an explicit token plan URL wins,
+// then the region cluster for Token Plan keys; pay-as-you-go uses base_url or the global host.
 func baseURLForCredential(apiKey string) string {
 	cfg := currentConfig()
 	tokenPlan := isTokenPlanKey(apiKey)
-	base := cfg.BaseURL
 	if tokenPlan {
-		base = cfg.TokenPlanBaseURL
+		if cfg.TokenPlanBaseURL != "" {
+			return cfg.TokenPlanBaseURL
+		}
+		return tokenPlanHostForRegion(cfg.Region)
 	}
-	if base != "" {
-		return base
-	}
-	if tokenPlan {
-		return tokenPlanBaseURL
+	if cfg.BaseURL != "" {
+		return cfg.BaseURL
 	}
 	return payAsYouGoBaseURL
 }
