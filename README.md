@@ -108,6 +108,7 @@ What the panel does:
 | **新增 API Key** | writes `<id>.json` into the auth directory through the host; kind and target URL are shown immediately |
 | **测速** | one small upstream request per credential, reporting HTTP status and latency |
 | **发现模型** / **全部发现模型** | asks the upstream, model by model, which ones this key may use |
+| **删除** | removes the auth file through CPA's own `DELETE /v0/management/auth-files` and clears the row immediately |
 
 Every credential row shows its kind (`pay-as-you-go`, `token-plan`, `token-plan-team`, `unknown`),
 the base URL it targets, counters, the last status and the discovered model set. Rows merge the
@@ -120,8 +121,19 @@ hands CPA a catalog without the models that credential rejected, while the provi
 over; nothing is ever written back into your credential files.
 
 The panel routes are `GET /v0/management/plugins/mimo-cliproxyapi/state`,
-`POST .../credentials`, `POST .../probe` (optional `model`) and `POST .../discover`
-(`{"auth_index":...}` or `{"all":true}`).
+`POST .../credentials`, `POST .../probe` (optional `model`), `POST .../discover`
+(`{"auth_index":...}` or `{"all":true}`) and `POST .../forget` (hide a row whose file is already gone).
+Delete needs CPA's own auth-file API, so the page calls `DELETE /v0/management/auth-files` with the
+same management key; a plugin cannot delete auth files, the host exposes no callback for it.
+
+Facts worth knowing while operating the panel:
+
+- CPA caches its auth listing, so a credential deleted outside the panel (a plain `rm`) can keep
+  showing for a while. The plugin drops such a row for good two minutes after the host stops
+  listing it, and marks it `stale` as soon as a lookup says the file is gone.
+- The label you type wins: the host reports its own provider label (`mimo`), so the panel reads the
+  label from the credential file instead.
+- Discovery results are per credential and in memory; a plugin reload starts discovery over.
 
 Resource responses are not management-authenticated, so the shell carries no data: it reads the
 management key from the panel's own storage when it runs inside the management center, or asks for

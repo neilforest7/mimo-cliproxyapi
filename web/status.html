@@ -69,6 +69,7 @@
 
   <script>
     const BASE = "__MANAGEMENT_BASE__";
+    const MGMT_ROOT = BASE.replace(/\/plugins\/[^/]+$/, "");
     const KEY_STORAGE = "mimo-provider-management-key";
     let key = "";
 
@@ -167,6 +168,7 @@
 
     function credentialRow(row, index) {
       const tr = document.createElement("tr");
+      if (row.stale) tr.className = "stale";
       tr.appendChild(element("td", "mono", String(index + 1)));
 
       const nameCell = document.createElement("td");
@@ -187,8 +189,14 @@
 
       const actionCell = document.createElement("td");
       actionCell.className = "actions";
-      actionCell.appendChild(actionButton("测速", function (button) { probe(row, button); }, !row.probe_available, "该凭据还没有运行时索引，重新加载插件后再试"));
-      actionCell.appendChild(actionButton("发现模型", function (button) { discover(row, button); }, !row.probe_available, "该凭据还没有运行时索引，重新加载插件后再试"));
+      if (row.stale) {
+        actionCell.appendChild(element("span", "badge bad", "文件已删除"));
+      } else {
+        actionCell.appendChild(actionButton("测速", function (button) { probe(row, button); }, !row.probe_available, "该凭据还没有运行时索引，重新加载插件后再试"));
+        actionCell.appendChild(actionButton("发现模型", function (button) { discover(row, button); }, !row.probe_available, "该凭据还没有运行时索引，重新加载插件后再试"));
+      }
+      const canDelete = (row.name || "").toLowerCase().endsWith(".json");
+      actionCell.appendChild(actionButton("删除", function (button) { removeCredential(row, button); }, !canDelete, "该行没有对应的 auth 文件"));
       tr.appendChild(actionCell);
       return tr;
     }
@@ -223,9 +231,12 @@
       state.credentials.forEach(function (row, index) {
         credentialsBody.appendChild(credentialRow(row, index));
       });
+      const staleCount = state.credentials.filter(function (row) { return row.stale; }).length;
       text("credentialsHint", state.credentials_error
         ? "凭据列表读取失败：" + state.credentials_error
-        : (state.credentials.length ? "模型能力来自真实请求：测速或发现模型会记录该凭据能用哪些模型，插件重载后重新发现。" : "还没有 MiMo 凭据，用上面的表单添加一个。"));
+        : (staleCount
+          ? "有 " + staleCount + " 行对应的 auth 文件已不存在（host 列表还在缓存），点"删除"清理。"
+          : (state.credentials.length ? "模型能力来自真实请求：测速或发现模型会记录该凭据能用哪些模型，插件重载后重新发现。" : "还没有 MiMo 凭据，用上面的表单添加一个。")));
 
       const catalogBody = document.querySelector("#catalog tbody");
       catalogBody.textContent = "";
@@ -294,6 +305,35 @@
         button.title = err.message;
       }
       setTimeout(function () { button.disabled = false; button.textContent = original; }, 8000);
+      refresh();
+    }
+
+    async function removeCredential(row, button) {
+      const fileName = row.name || "";
+      if (!fileName.toLowerCase().endsWith(".json")) return;
+      if (!window.confirm("删除凭据 " + fileName + "？会从 CPA 的 auth 目录移除该文件。")) return;
+      button.disabled = true;
+      button.textContent = "删除中";
+      try {
+        const response = await fetch(MGMT_ROOT + "/auth-files", {
+          method: "DELETE",
+          headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+          body: JSON.stringify({ name: fileName }),
+        });
+        const payload = await response.json().catch(function () { return {}; });
+        if (!response.ok) throw new Error(payload.error || ("HTTP " + response.status));
+        // Clear the row even while the host list still caches the deleted credential.
+        await api("/forget", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: row.id }),
+        });
+        button.textContent = "已删除";
+      } catch (err) {
+        button.textContent = "删除失败";
+        button.title = err.message;
+        setTimeout(function () { button.disabled = false; button.textContent = "删除"; }, 6000);
+      }
       refresh();
     }
 

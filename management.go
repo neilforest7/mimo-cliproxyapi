@@ -55,6 +55,7 @@ func managementRegister(raw []byte) ([]byte, error) {
 			{Method: http.MethodPost, Path: "/credentials", Description: "Adds an API key as a MiMo auth file."},
 			{Method: http.MethodPost, Path: "/probe", Description: "Runs one small request with a credential."},
 			{Method: http.MethodPost, Path: "/discover", Description: "Discovers the models a credential accepts."},
+			{Method: http.MethodPost, Path: "/forget", Description: "Clears a credential row that the host already deleted."},
 		},
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        statusResourcePath,
@@ -88,6 +89,8 @@ func managementHandle(raw []byte) ([]byte, error) {
 		return probeCredential(host, req.Body)
 	case method == http.MethodPost && strings.HasSuffix(path, "/discover"):
 		return discoverCredential(host, req.Body)
+	case method == http.MethodPost && strings.HasSuffix(path, "/forget"):
+		return forgetCredential(host, req.Body)
 	default:
 		return jsonManagementResponse(http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -122,6 +125,8 @@ type credentialStatus struct {
 	LastError      string            `json:"last_error,omitempty"`
 	LastUsed       string            `json:"last_used,omitempty"`
 	ModelSupport   map[string]string `json:"model_support,omitempty"`
+	// Stale marks a credential the host still lists but whose file is already gone.
+	Stale bool `json:"stale,omitempty"`
 }
 
 type statusView struct {
@@ -219,11 +224,23 @@ func collectStatus(host HostClient) statusView {
 			row.LastUsed = stat.LastUsed.UTC().Format(time.RFC3339)
 		}
 		row.ModelSupport = modelSupportView(id)
-		// Fill in kind and URL for credentials that never served a request yet.
-		if row.Kind == "" && row.AuthIndex != "" && hints < maxHintsPerState {
+		row.Stale = isCredentialStale(id)
+		// The auth file is the truth for kind, target and label: the host reports its own
+		// provider label (for example "mimo") instead of the one the user typed.
+		needsHint := !row.Stale && row.AuthIndex != "" && hints < maxHintsPerState &&
+			(row.Kind == "" || row.Label == "" || strings.EqualFold(row.Label, providerKey))
+		if needsHint {
 			hints++
-			if kind, url, ok := credentialHint(ctx, host, row); ok {
-				row.Kind, row.URL = kind, url
+			if hint, ok := credentialHint(ctx, host, row); ok {
+				if hint.kind != "" {
+					row.Kind = hint.kind
+				}
+				if hint.url != "" {
+					row.URL = hint.url
+				}
+				if hint.label != "" {
+					row.Label = hint.label
+				}
 			}
 		}
 		if row.Kind == "" {
@@ -231,8 +248,18 @@ func collectStatus(host HostClient) statusView {
 		}
 	}
 	pruneStats(hostPresent)
+	releaseForgotten(hostPresent)
 	view.Credentials = make([]credentialStatus, 0, len(order))
 	for _, id := range order {
+		if isCredentialForgotten(id) {
+			continue
+		}
+		// A stale row only lingers while the host list is still caching it.
+		if rows[id].Stale {
+			if _, stillListed := hostPresent[id]; !stillListed {
+				continue
+			}
+		}
 		view.Credentials = append(view.Credentials, *rows[id])
 	}
 	sort.Slice(view.Credentials, func(i, j int) bool { return view.Credentials[i].ID < view.Credentials[j].ID })
@@ -322,29 +349,38 @@ var credentialHints = struct {
 type hintEntry struct {
 	kind    string
 	url     string
+	label   string
 	fetched time.Time
 }
 
-func credentialHint(ctx context.Context, host HostClient, row *credentialStatus) (string, string, bool) {
+func credentialHint(ctx context.Context, host HostClient, row *credentialStatus) (hintEntry, bool) {
 	credentialHints.Lock()
 	entry, ok := credentialHints.entries[row.ID]
 	credentialHints.Unlock()
 	if ok && time.Since(entry.fetched) < hintTTL {
-		return entry.kind, entry.url, true
+		return entry, true
 	}
 	raw, errGet := host.AuthGetJSON(ctx, row.AuthIndex)
 	if errGet != nil {
-		return "", "", false
+		if credentialGone(errGet) {
+			markCredentialStale(row.ID)
+		}
+		return hintEntry{}, false
 	}
 	key := credentialKeyFromStorage(raw)
 	if key == "" {
-		return "", "", false
+		return hintEntry{}, false
 	}
-	entry = hintEntry{kind: credentialKind(key), url: baseURLForCredential(key), fetched: time.Now()}
+	entry = hintEntry{
+		kind:    credentialKind(key),
+		url:     baseURLForCredential(key),
+		label:   credentialLabelFromStorage(raw),
+		fetched: time.Now(),
+	}
 	credentialHints.Lock()
 	credentialHints.entries[row.ID] = entry
 	credentialHints.Unlock()
-	return entry.kind, entry.url, true
+	return entry, true
 }
 
 // addCredential turns a key typed into the panel into a MiMo auth file. The key is sent to
@@ -387,6 +423,7 @@ func addCredential(host HostClient, body []byte) ([]byte, error) {
 	credentialHints.entries[normalizeCredentialID(record.ID)] = hintEntry{
 		kind:    credentialKind(apiKey),
 		url:     baseURLForCredential(apiKey),
+		label:   record.Label,
 		fetched: time.Now(),
 	}
 	credentialHints.Unlock()
@@ -493,6 +530,12 @@ func discoverCredential(host HostClient, body []byte) ([]byte, error) {
 		}
 		raw, errGet := host.AuthGetJSON(ctx, target.authIndex)
 		if errGet != nil {
+			if credentialGone(errGet) {
+				markCredentialStale(target.id)
+				markCredentialStale(target.authIndex)
+				credentialResults = append(credentialResults, map[string]any{"id": target.id, "stale": true, "error": "credential no longer exists"})
+				continue
+			}
 			credentialResults = append(credentialResults, map[string]any{"id": target.id, "error": "credential lookup failed"})
 			continue
 		}
@@ -512,6 +555,149 @@ func discoverCredential(host HostClient, body []byte) ([]byte, error) {
 		})
 	}
 	return jsonManagementResponse(http.StatusOK, map[string]any{"credentials": credentialResults})
+}
+
+// staleCredentials remembers credentials whose auth file disappeared while the host list
+// still carried them; they are hidden as soon as the host list drops them too.
+var staleCredentials = struct {
+	sync.Mutex
+	ids map[string]struct{}
+}{ids: map[string]struct{}{}}
+
+func markCredentialStale(authID string) {
+	id := normalizeCredentialID(authID)
+	if id == "" {
+		return
+	}
+	staleCredentials.Lock()
+	staleCredentials.ids[id] = struct{}{}
+	staleCredentials.Unlock()
+	dropStats(id)
+	credentialHints.Lock()
+	delete(credentialHints.entries, id)
+	credentialHints.Unlock()
+}
+
+// forgottenCredentials holds rows the operator cleared from the panel: they stay hidden
+// right away even while the host list is still caching the deleted credential.
+var forgottenCredentials = struct {
+	sync.Mutex
+	ids map[string]struct{}
+}{ids: map[string]struct{}{}}
+
+func markCredentialForgotten(authID string) {
+	id := normalizeCredentialID(authID)
+	if id == "" {
+		return
+	}
+	forgottenCredentials.Lock()
+	forgottenCredentials.ids[id] = struct{}{}
+	forgottenCredentials.Unlock()
+}
+
+func isCredentialForgotten(authID string) bool {
+	id := normalizeCredentialID(authID)
+	if id == "" {
+		return false
+	}
+	forgottenCredentials.Lock()
+	defer forgottenCredentials.Unlock()
+	_, ok := forgottenCredentials.ids[id]
+	return ok
+}
+
+// releaseForgotten drops markers for credentials the host no longer lists, so a later
+// re-created credential becomes visible again.
+func releaseForgotten(present map[string]struct{}) {
+	forgottenCredentials.Lock()
+	defer forgottenCredentials.Unlock()
+	for id := range forgottenCredentials.ids {
+		if _, listed := present[id]; !listed {
+			delete(forgottenCredentials.ids, id)
+		}
+	}
+}
+
+func isCredentialStale(authID string) bool {
+	id := normalizeCredentialID(authID)
+	if id == "" {
+		return false
+	}
+	staleCredentials.Lock()
+	defer staleCredentials.Unlock()
+	_, ok := staleCredentials.ids[id]
+	return ok
+}
+
+func clearCredentialStale(authID string) {
+	id := normalizeCredentialID(authID)
+	if id == "" {
+		return
+	}
+	staleCredentials.Lock()
+	delete(staleCredentials.ids, id)
+	staleCredentials.Unlock()
+}
+
+// credentialGone reports whether a host error means the credential no longer exists
+// (usually because its auth file was deleted outside the panel).
+func credentialGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"not found", "no such file", "does not exist", "unknown credential", "credentials not found"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// forgetCredential clears a row for a credential the operator already removed.
+func forgetCredential(host HostClient, body []byte) ([]byte, error) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if len(body) > 0 {
+		if errUnmarshal := json.Unmarshal(body, &req); errUnmarshal != nil {
+			return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "malformed forget request body"})
+		}
+	}
+	id := normalizeCredentialID(req.ID)
+	if id == "" {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]string{"error": "id is required"})
+	}
+	// A caller may pass the record id, the file name or the runtime index; hide every name
+	// the same credential travels under so forget never silently no-ops.
+	names := []string{id}
+	lookupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if entries, errList := host.AuthList(lookupCtx); errList == nil {
+		for _, entry := range entries {
+			candidates := []string{entry.ID, entry.AuthIndex, entry.Name}
+			matched := false
+			for _, candidate := range candidates {
+				if normalizeCredentialID(candidate) == id {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			for _, candidate := range candidates {
+				if key := normalizeCredentialID(candidate); key != "" {
+					names = append(names, key)
+				}
+			}
+		}
+	}
+	for _, name := range names {
+		markCredentialStale(name)
+		markCredentialForgotten(name)
+	}
+	return jsonManagementResponse(http.StatusOK, map[string]any{"status": "ok", "id": id, "note": "the row returns if the host still lists the credential"})
 }
 
 // credentialIdentityFor resolves the identity the executor and model.for_auth also use:
@@ -554,6 +740,13 @@ func probeCredential(host HostClient, body []byte) ([]byte, error) {
 	defer cancel()
 	rawCredential, errGet := host.AuthGetJSON(ctx, authIndex)
 	if errGet != nil {
+		if credentialGone(errGet) {
+			markCredentialStale(credentialIdentityFor(ctx, host, authIndex, req.AuthID))
+			markCredentialStale(authIndex)
+			return jsonManagementResponse(http.StatusConflict, map[string]string{
+				"error": "this credential no longer exists; remove the row from the panel",
+			})
+		}
 		return jsonManagementResponse(http.StatusBadGateway, map[string]string{"error": "credential lookup failed: " + errGet.Error()})
 	}
 	apiKey := credentialKeyFromStorage(rawCredential)

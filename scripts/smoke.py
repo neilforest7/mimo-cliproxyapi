@@ -58,6 +58,11 @@ class PluginAPI(ctypes.Structure):
     _fields_ = [("abi_version", ctypes.c_uint32), ("call", CallFn), ("free_buffer", FreeFn), ("shutdown", ShutdownFn)]
 
 
+class HostError(Exception):
+    """Raised by the fake host to answer a callback with an error envelope."""
+    pass
+
+
 class FakeHost:
     """Answers the host callbacks the plugin uses and records what it asked for."""
 
@@ -71,6 +76,7 @@ class FakeHost:
         self.stream_chunk = 0
         self.status = 200
         self.unsupported = {"mimo-v2.6-pro-ultraspeed"}
+        self.gone: set[str] = set()
         self.saved_name = ""
         self.saved_payload = None
 
@@ -124,7 +130,10 @@ class FakeHost:
             self.saved_payload = payload.get("json")
             return {"name": self.saved_name, "path": "/auths/" + self.saved_name}
         if method == "host.auth.get":
-            return {"auth_index": payload.get("auth_index", ""), "json": {"type": PROVIDER, "id": "a1", "api_key": "sk-smoke"}}
+            auth_index = payload.get("auth_index", "")
+            if auth_index in self.gone:
+                raise HostError("auth file not found for auth_index " + auth_index)
+            return {"auth_index": auth_index, "json": {"type": PROVIDER, "id": "a1", "api_key": "sk-smoke"}}
         if method == "host.stream.emit":
             self.emitted.append(base64.b64decode(payload["payload"]))
             return {}
@@ -162,10 +171,15 @@ def main() -> int:
             return 1
         try:
             result = host.handle(method.decode(), payload)
+        except HostError as err:
+            result = None
+            envelope = {"ok": False, "error": {"code": "host_error", "message": str(err)}}
         except AssertionError as err:
             print(err, file=sys.stderr)
             return 1
-        raw = json.dumps({"ok": True, "result": result}).encode()
+        else:
+            envelope = {"ok": True, "result": result}
+        raw = json.dumps(envelope).encode()
         block = libc.malloc(len(raw))
         ctypes.memmove(block, raw, len(raw))
         response = ctypes.cast(response_ptr, ctypes.POINTER(Buffer)).contents
@@ -304,7 +318,7 @@ def main() -> int:
             print(f"unexpected management resources: {resources}", file=sys.stderr)
             return 1
         paths = sorted(route["Path"] for route in routes)
-        if paths != ["/credentials", "/discover", "/probe", "/state"]:
+        if paths != ["/credentials", "/discover", "/forget", "/probe", "/state"]:
             print(f"unexpected management routes: {paths}", file=sys.stderr)
             return 1
         checks += 1
@@ -405,6 +419,24 @@ def main() -> int:
         primary = rows.get("a1")
         if not primary or primary.get("kind") != "pay-as-you-go" or primary.get("model_support", {}).get("mimo-v2.6-pro-ultraspeed") != "unsupported":
             print(f"state lost the discovered routing: {state['credentials']}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        # 凭据文件被删掉：probe 应给 409，forget 后行立即消失（host 列表还在缓存）
+        host.gone.add("a1")
+        status, body = manage("POST", BASE_PATH + "/probe", json.dumps({"auth_index": "a1"}).encode())
+        if status != 409:
+            print(f"probe on a deleted credential answered {status}: {body}", file=sys.stderr)
+            return 1
+        status, body = manage("POST", BASE_PATH + "/forget", json.dumps({"id": "a1"}).encode())
+        forgotten = decode(body, "forget")
+        if status != 200 or forgotten.get("status") != "ok":
+            print(f"forget failed: {forgotten}", file=sys.stderr)
+            return 1
+        status, body = manage("GET", BASE_PATH + "/state")
+        state = decode(body, "state")
+        if any(row["id"] == "a1" for row in state["credentials"]):
+            print(f"forgotten credential still listed: {state['credentials']}", file=sys.stderr)
             return 1
         checks += 1
 

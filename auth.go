@@ -100,6 +100,15 @@ func credentialIDFromStorage(storage []byte) string {
 	return normalizeCredentialID(record.ID)
 }
 
+// credentialLabelFromStorage reads the user-provided label of a stored credential.
+func credentialLabelFromStorage(storage []byte) string {
+	var record authRecord
+	if err := json.Unmarshal(storage, &record); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(record.Label)
+}
+
 // credentialKeyFromStorage reads the api key of a stored credential JSON.
 func credentialKeyFromStorage(storage []byte) string {
 	var record authRecord

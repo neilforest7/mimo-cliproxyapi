@@ -339,27 +339,124 @@ func TestUnknownKeyPrefixIsReportedNotGuessed(t *testing.T) {
 	}
 }
 
-func TestPruneStatsDropsForgottenCredentials(t *testing.T) {
-	resetSupportState()
+func TestPruneStatsKeepsAGraceThenDropsAbsentCredentials(t *testing.T) {
+	resetStatsState()
 	stats.Lock()
 	stats.byAuth = map[string]*authStat{
 		"live":    {Requests: 1, LastUsed: time.Now()},
-		"stale":   {Requests: 1, LastUsed: time.Now().Add(-48 * time.Hour)},
-		"runtime": {Requests: 1, LastUsed: time.Now().Add(-48 * time.Hour)},
+		"deleted": {Requests: 1, LastUsed: time.Now()},
+		"runtime": {Requests: 1, LastUsed: time.Now()},
 	}
 	stats.Unlock()
 
+	// First snapshot without the deleted credential: marked, not dropped (the host list caches).
 	pruneStats(map[string]struct{}{"live": {}, "runtime": {}})
+	stats.Lock()
+	if _, ok := stats.byAuth["deleted"]; !ok {
+		stats.Unlock()
+		t.Fatalf("row disappeared before the grace window")
+	}
+	stats.byAuth["deleted"].absentSince = time.Now().Add(-statsAbsentGrace - time.Second)
+	stats.Unlock()
 
+	// Second snapshot after the grace window: the phantom row goes away.
+	pruneStats(map[string]struct{}{"live": {}, "runtime": {}})
 	stats.Lock()
 	defer stats.Unlock()
-	if _, ok := stats.byAuth["stale"]; ok {
-		t.Fatalf("stale credential row survived: %+v", stats.byAuth)
+	if _, ok := stats.byAuth["deleted"]; ok {
+		t.Fatalf("deleted credential row survived the grace window: %+v", stats.byAuth)
 	}
 	if _, ok := stats.byAuth["live"]; !ok {
 		t.Fatalf("live credential row was dropped: %+v", stats.byAuth)
 	}
 	if _, ok := stats.byAuth["runtime"]; !ok {
 		t.Fatalf("host-listed credential row was dropped: %+v", stats.byAuth)
+	}
+
+	// A host-listed credential loses its absence marker again.
+	stats.byAuth["live"].absentSince = time.Now().Add(-time.Minute)
+	stats.Unlock()
+	pruneStats(map[string]struct{}{"live": {}, "runtime": {}})
+	stats.Lock()
+	if !stats.byAuth["live"].absentSince.IsZero() {
+		t.Fatalf("presence did not clear the absence marker")
+	}
+}
+
+func TestStatePrefersTheStoredLabelOverTheHostLabel(t *testing.T) {
+	host := &fakeHost{
+		authEntries: []pluginapi.HostAuthFileEntry{{
+			AuthIndex: "a1", ID: "mimo-sk-5", Name: "mimo-sk-5.json", Provider: providerKey, Label: "mimo",
+		}},
+		authJSON: map[string]json.RawMessage{
+			"a1": json.RawMessage(`{"type":"mimo","id":"mimo-sk-5","label":"ops-verify","api_key":"sk-abcdef"}`),
+		},
+	}
+	resetPluginState(t, host)
+
+	_, _, body := managementCall(t, http.MethodGet, "/v0/management/plugins/mimo-cliproxyapi/state", nil)
+	var state statusView
+	if errUnmarshal := json.Unmarshal(body, &state); errUnmarshal != nil {
+		t.Fatalf("state is not JSON: %s", body)
+	}
+	if len(state.Credentials) != 1 || state.Credentials[0].Label != "ops-verify" {
+		t.Fatalf("label not taken from the credential file: %+v", state.Credentials)
+	}
+}
+
+func TestProbeOnDeletedCredentialMarksTheRowStale(t *testing.T) {
+	host := &fakeHost{
+		authEntries: []pluginapi.HostAuthFileEntry{{AuthIndex: "a1", ID: "mimo-sk-6", Name: "mimo-sk-6.json", Provider: providerKey}},
+		authJSON: map[string]json.RawMessage{
+			"a1": json.RawMessage(`{"type":"mimo","id":"mimo-sk-6","api_key":"sk-abcdef"}`),
+		},
+		doResponse: pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"id":"chatcmpl-1"}`)},
+	}
+	resetPluginState(t, host)
+	host.mu.Lock()
+	host.doResponse = pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"id":"chatcmpl-1"}`)}
+	host.mu.Unlock()
+	callMethod(t, "executor.execute", map[string]any{
+		"AuthID":         "mimo-sk-6",
+		"AuthAttributes": map[string]string{"api_key": "sk-abcdef"},
+		"Payload":        []byte(`{"model":"mimo-v2.6-pro"}`),
+	})
+
+	// The file disappears while the host list still carries the credential.
+	host.mu.Lock()
+	host.authJSON = map[string]json.RawMessage{}
+	host.mu.Unlock()
+
+	status, _, body := managementCall(t, http.MethodPost, "/v0/management/plugins/mimo-cliproxyapi/probe", map[string]any{"auth_index": "a1"})
+	if status != http.StatusConflict {
+		t.Fatalf("probe on a deleted credential should be a 409, got %d: %s", status, body)
+	}
+	if !isCredentialStale("mimo-sk-6") {
+		t.Fatalf("deleted credential was not marked stale")
+	}
+	if stat := statsFor("mimo-sk-6"); stat.Requests != 0 {
+		t.Fatalf("stale credential kept its counters: %+v", stat)
+	}
+
+	_, _, stateBody := managementCall(t, http.MethodGet, "/v0/management/plugins/mimo-cliproxyapi/state", nil)
+	var state statusView
+	if errUnmarshal := json.Unmarshal(stateBody, &state); errUnmarshal != nil {
+		t.Fatalf("state is not JSON: %s", stateBody)
+	}
+	if len(state.Credentials) != 1 || !state.Credentials[0].Stale {
+		t.Fatalf("state must flag the stale row: %+v", state.Credentials)
+	}
+
+	// Forget hides the row even while the host list still caches it.
+	forgetStatus, _, _ := managementCall(t, http.MethodPost, "/v0/management/plugins/mimo-cliproxyapi/forget", map[string]any{"id": "a1"})
+	if forgetStatus != http.StatusOK {
+		t.Fatalf("forget returned %d", forgetStatus)
+	}
+	_, _, stateBody = managementCall(t, http.MethodGet, "/v0/management/plugins/mimo-cliproxyapi/state", nil)
+	if errUnmarshal := json.Unmarshal(stateBody, &state); errUnmarshal != nil {
+		t.Fatalf("state is not JSON: %s", stateBody)
+	}
+	if len(state.Credentials) != 0 {
+		t.Fatalf("forgotten credential still listed: %+v", state.Credentials)
 	}
 }

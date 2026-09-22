@@ -16,12 +16,17 @@ type authStat struct {
 	LastStatus int
 	LastError  string
 	LastUsed   time.Time
+	// absentSince marks the first snapshot in which the host no longer listed this
+	// credential; the row is dropped once the grace window passes.
+	absentSince time.Time
 }
 
-// statsRetention drops counter rows for credentials the host no longer knows about.
+// Counter rows survive a short absence so the host's auth-list cache and a momentary
+// reload do not wipe them, then disappear so a deleted credential leaves no phantom row.
 const (
-	statsRetention = 24 * time.Hour
-	statsMaxRows   = 512
+	statsAbsentGrace = 2 * time.Minute
+	statsRetention   = 24 * time.Hour
+	statsMaxRows     = 512
 )
 
 var stats = struct {
@@ -80,6 +85,17 @@ func statEntryLocked(byAuth map[string]*authStat, id string) *authStat {
 	return entry
 }
 
+// dropStats forgets one credential immediately; used when the host says it is gone.
+func dropStats(authID string) {
+	id := normalizeCredentialID(authID)
+	if id == "" {
+		return
+	}
+	stats.Lock()
+	defer stats.Unlock()
+	delete(stats.byAuth, id)
+}
+
 // statsFor returns the counters of one credential.
 func statsFor(authID string) authStat {
 	stats.Lock()
@@ -104,17 +120,22 @@ func statsAuthIDs() []string {
 	return statKeysLocked()
 }
 
-// pruneStats drops rows for credentials the host no longer lists once they have been
-// unused for statsRetention, and keeps the map bounded.
+// pruneStats drops rows the host no longer lists — after a short grace so a cached
+// listing or a reload does not erase live counters — and keeps the map bounded.
 func pruneStats(present map[string]struct{}) {
 	stats.Lock()
 	defer stats.Unlock()
 	now := time.Now()
 	for id, entry := range stats.byAuth {
 		if _, known := present[id]; known {
+			entry.absentSince = time.Time{}
 			continue
 		}
-		if now.Sub(entry.LastUsed) > statsRetention {
+		if entry.absentSince.IsZero() {
+			entry.absentSince = now
+			continue
+		}
+		if now.Sub(entry.absentSince) > statsAbsentGrace || now.Sub(entry.LastUsed) > statsRetention {
 			delete(stats.byAuth, id)
 		}
 	}

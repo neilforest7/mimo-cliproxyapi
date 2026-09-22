@@ -88,3 +88,6 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
 
 .small { font-size: 11.5px; }
 .actions { display: flex; gap: 6px; white-space: nowrap; }
+
+tr.stale td { opacity: 0.55; }
+tr.stale td:last-child { opacity: 1; }

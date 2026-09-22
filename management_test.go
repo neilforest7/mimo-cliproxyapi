@@ -94,8 +94,8 @@ func TestManagementRegisterPublishesMenuAndRoutes(t *testing.T) {
 		t.Fatalf("unexpected resource: %v", resource)
 	}
 	routes, _ := result["Routes"].([]any)
-	if len(routes) != 4 {
-		t.Fatalf("expected four routes, got %v", result["Routes"])
+	if len(routes) != 5 {
+		t.Fatalf("expected five routes, got %v", result["Routes"])
 	}
 	if !strings.Contains(renderStatusPage(), "/v0/management/plugins/mimo-cliproxyapi") {
 		t.Fatalf("page did not pick up the management base path")
