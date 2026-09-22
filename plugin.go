@@ -36,6 +36,8 @@ const (
 	chatCompletionsPath   = "/chat/completions"
 
 	payAsYouGoBaseURL = "https://api.xiaomimimo.com/v1"
+	// payAsYouGoKeyPrefix is the documented prefix of console API keys.
+	payAsYouGoKeyPrefix = "sk-"
 	// Token Plan (coding plan) credentials use their own cluster hosts.
 	tokenPlanHostCN  = "https://token-plan-cn.xiaomimimo.com/v1"
 	tokenPlanHostSGP = "https://token-plan-sgp.xiaomimimo.com/v1"
@@ -82,8 +84,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodPluginQuiesce:
 		return okEnvelope(nil)
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
+	case pluginabi.MethodModelStatic:
 		return okEnvelope(modelResponse())
+	case pluginabi.MethodModelForAuth:
+		return modelForAuth(request)
 	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodAuthIdentifier:
 		return okEnvelope(map[string]string{"identifier": providerKey})
 	case pluginabi.MethodAuthParse:
@@ -159,17 +163,7 @@ func pluginRegistration() registration {
 					Name:        "region",
 					Type:        pluginapi.ConfigFieldTypeEnum,
 					EnumValues:  []string{"cn", "sgp", "ams"},
-					Description: "Token Plan cluster: cn (default), sgp, ams.",
-				},
-				{
-					Name:        "base_url",
-					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Pay-as-you-go MiMo base URL. Default " + payAsYouGoBaseURL,
-				},
-				{
-					Name:        "token_plan_base_url",
-					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Overrides the Token Plan cluster host for tp-/ttp- keys.",
+					Description: "Token Plan cluster for tp-/ttp- keys: cn (default), sgp, ams. sk- keys always use the global host.",
 				},
 				{
 					Name:        "request_timeout_seconds",
@@ -205,8 +199,6 @@ type modelEntry struct {
 
 type pluginConfig struct {
 	Region                string       `yaml:"region"`
-	BaseURL               string       `yaml:"base_url"`
-	TokenPlanBaseURL      string       `yaml:"token_plan_base_url"`
 	RequestTimeoutSeconds int          `yaml:"request_timeout_seconds"`
 	Models                []modelEntry `yaml:"models"`
 }
@@ -224,8 +216,6 @@ func configure(raw []byte) error {
 			return err
 		}
 	}
-	cfg.BaseURL = strings.TrimSpace(cfg.BaseURL)
-	cfg.TokenPlanBaseURL = strings.TrimSpace(cfg.TokenPlanBaseURL)
 	if cfg.RequestTimeoutSeconds <= 0 {
 		cfg.RequestTimeoutSeconds = defaultRequestTimeoutSeconds
 	}
@@ -263,19 +253,12 @@ func isTokenPlanKey(apiKey string) bool {
 	return false
 }
 
-// baseURLForCredential resolves the upstream base URL: an explicit token plan URL wins,
-// then the region cluster for Token Plan keys; pay-as-you-go uses base_url or the global host.
+// baseURLForCredential resolves the upstream host from the credential kind: Token Plan
+// keys (tp-/ttp-) use their cluster, everything else uses the global pay-as-you-go host.
+// Unknown prefixes are classified as "unknown" in the panel and go to the global host.
 func baseURLForCredential(apiKey string) string {
-	cfg := currentConfig()
-	tokenPlan := isTokenPlanKey(apiKey)
-	if tokenPlan {
-		if cfg.TokenPlanBaseURL != "" {
-			return cfg.TokenPlanBaseURL
-		}
-		return tokenPlanHostForRegion(cfg.Region)
-	}
-	if cfg.BaseURL != "" {
-		return cfg.BaseURL
+	if isTokenPlanKey(apiKey) {
+		return tokenPlanHostForRegion(currentConfig().Region)
 	}
 	return payAsYouGoBaseURL
 }

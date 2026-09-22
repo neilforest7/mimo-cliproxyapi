@@ -12,9 +12,10 @@
       <div>
         <div class="eyebrow"><span class="dot" id="healthDot"></span><span id="healthLabel">读取状态中</span></div>
         <h1>MiMo Provider</h1>
-        <p class="subtitle">小米 MiMo 凭据、路由与请求计数 · 版本 <span id="version">__PLUGIN_VERSION__</span></p>
+        <p class="subtitle">小米 MiMo 凭据、路由与模型能力 · 版本 <span id="version">__PLUGIN_VERSION__</span></p>
       </div>
       <div class="header-actions">
+        <button class="btn" id="discoverAll" type="button">全部发现模型</button>
         <button class="btn" id="reload" type="button">刷新</button>
       </div>
     </header>
@@ -22,7 +23,7 @@
     <section class="card auth-card" id="authCard">
       <label for="keyInput">管理密钥（Management Key）</label>
       <div class="row">
-        <input id="keyInput" type="password" placeholder="从管理面板配置里复制，或留空自动读取" autocomplete="off">
+        <input id="keyInput" type="password" placeholder="在管理面板里自动读取，或在这里填入" autocomplete="off">
         <button class="btn primary" id="saveKey" type="button">使用</button>
       </div>
       <p class="hint" id="authHint"></p>
@@ -36,16 +37,20 @@
     </section>
 
     <section class="card">
-      <h2>路由配置</h2>
-      <dl class="kv" id="configList"></dl>
-      <p class="hint">Region 与两个 Base URL 都能在插件配置里改，改完自动生效；Token Plan 键（tp- / ttp-）走集群域名，sk- 键走按量域名。</p>
+      <h2>新增 API Key</h2>
+      <div class="row wrap">
+        <input id="newKey" type="password" placeholder="sk-xxxxx（按量）或 tp-/ttp-xxxxx（Token Plan）" autocomplete="off">
+        <input id="newLabel" type="text" placeholder="备注（可选）" autocomplete="off">
+        <button class="btn primary" id="addKey" type="button">添加凭据</button>
+      </div>
+      <p class="hint" id="addHint">直接写入 CPA 的 auth 目录，无需重启：CPA 会自动加载新凭据。key 只落盘、不回显。</p>
     </section>
 
     <section class="card">
       <h2>凭据</h2>
       <table class="table" id="credentials">
         <thead>
-          <tr><th>#</th><th>凭据</th><th>类型</th><th>状态</th><th>请求 / 失败</th><th>最近</th><th></th></tr>
+          <tr><th>#</th><th>凭据</th><th>类型</th><th>目标</th><th>状态</th><th>请求 / 失败</th><th>最近</th><th>模型能力</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
@@ -58,7 +63,7 @@
         <thead><tr><th>模型</th><th>上下文</th><th>最大输出</th></tr></thead>
         <tbody></tbody>
       </table>
-      <p class="hint">目录可在插件配置的 <code>models</code> 字段覆盖（JSON 数组）。</p>
+      <p class="hint">目录可用插件配置的 <code>models</code> 字段覆盖。同名模型若被其它 provider 占用，host 会去重，这里仍按插件发布的内容显示。</p>
     </section>
   </main>
 
@@ -106,16 +111,18 @@
       return typeof value === "number" ? value.toLocaleString() : "–";
     }
 
-    function addDefinition(list, label, value) {
-      list.appendChild(element("dt", "", label));
-      list.appendChild(element("dd", "", value || "默认"));
-    }
-
     function kindLabel(kind) {
       if (kind === "token-plan") return "Token Plan";
       if (kind === "token-plan-team") return "Token Plan (团队)";
       if (kind === "pay-as-you-go") return "按量计费";
-      return "未使用";
+      if (kind === "unknown") return "未知前缀";
+      return "未判定";
+    }
+
+    function kindClass(kind) {
+      if (kind === "unknown") return "bad";
+      if (kind) return "ok";
+      return "idle";
     }
 
     function statusText(row) {
@@ -132,34 +139,64 @@
       return "ok";
     }
 
+    function modelChips(row) {
+      const models = row.model_support || {};
+      const ids = Object.keys(models).sort();
+      if (!ids.length) return element("span", "hint", "未发现");
+      const wrap = element("div", "chips");
+      ids.forEach(function (id) {
+        const supported = models[id] === "supported";
+        const chip = element("span", "chip " + (supported ? "ok" : "bad"), (supported ? "✓ " : "✗ ") + id);
+        chip.title = supported ? "该凭据可用" : "上游返回不支持该模型";
+        wrap.appendChild(chip);
+      });
+      return wrap;
+    }
+
+    function actionButton(label, handler, disabled, title) {
+      const button = element("button", "btn small", label);
+      button.type = "button";
+      if (disabled) {
+        button.disabled = true;
+        button.title = title || "";
+      } else {
+        button.addEventListener("click", function () { handler(button); });
+      }
+      return button;
+    }
+
     function credentialRow(row, index) {
       const tr = document.createElement("tr");
       tr.appendChild(element("td", "mono", String(index + 1)));
 
       const nameCell = document.createElement("td");
-      nameCell.appendChild(element("div", "mono", row.name || row.auth_index));
+      nameCell.appendChild(element("div", "mono", row.name || row.id));
       if (row.label) nameCell.appendChild(element("div", "hint", row.label));
+      nameCell.appendChild(element("div", "hint mono", row.id));
       tr.appendChild(nameCell);
 
-      const kindCell = document.createElement("td");
-      kindCell.appendChild(element("span", "badge", kindLabel(row.kind)));
-      tr.appendChild(kindCell);
-
-      const statusCell = document.createElement("td");
-      statusCell.appendChild(element("span", "badge " + statusClass(row), statusText(row)));
-      tr.appendChild(statusCell);
-
+      tr.appendChild(cellWithBadge(kindLabel(row.kind), kindClass(row.kind)));
+      tr.appendChild(element("td", "mono small", row.url || "–"));
+      tr.appendChild(cellWithBadge(statusText(row), statusClass(row)));
       tr.appendChild(element("td", "mono", formatNumber(row.requests) + " / " + formatNumber(row.errors)));
-      tr.appendChild(element("td", "mono", row.last_used ? row.last_used.replace("T", " ").replace("Z", "") : "–"));
+      tr.appendChild(element("td", "mono small", row.last_used ? row.last_used.replace("T", " ").replace("Z", "") : "–"));
+
+      const modelsCell = document.createElement("td");
+      modelsCell.appendChild(modelChips(row));
+      tr.appendChild(modelsCell);
 
       const actionCell = document.createElement("td");
-      const button = element("button", "btn small", "测速");
-      button.type = "button";
-      button.addEventListener("click", function () { probe(row.auth_index, button); });
-      if (row.last_error) button.title = row.last_error;
-      actionCell.appendChild(button);
+      actionCell.className = "actions";
+      actionCell.appendChild(actionButton("测速", function (button) { probe(row, button); }, !row.probe_available, "该凭据还没有运行时索引，重新加载插件后再试"));
+      actionCell.appendChild(actionButton("发现模型", function (button) { discover(row, button); }, !row.probe_available, "该凭据还没有运行时索引，重新加载插件后再试"));
       tr.appendChild(actionCell);
       return tr;
+    }
+
+    function cellWithBadge(label, className) {
+      const td = document.createElement("td");
+      td.appendChild(element("span", "badge " + className, label));
+      return td;
     }
 
     function catalogRow(model) {
@@ -181,13 +218,6 @@
       document.getElementById("healthDot").className = "dot " + (healthy ? "ok" : "warn");
       text("healthLabel", healthy ? "已就绪" : "没有可用凭据");
 
-      const configList = document.getElementById("configList");
-      configList.textContent = "";
-      addDefinition(configList, "region", state.config.region);
-      addDefinition(configList, "base_url", state.config.base_url);
-      addDefinition(configList, "token_plan_base_url", state.config.token_plan_base_url);
-      addDefinition(configList, "request_timeout_seconds", String(state.config.request_timeout_seconds));
-
       const credentialsBody = document.querySelector("#credentials tbody");
       credentialsBody.textContent = "";
       state.credentials.forEach(function (row, index) {
@@ -195,7 +225,7 @@
       });
       text("credentialsHint", state.credentials_error
         ? "凭据列表读取失败：" + state.credentials_error
-        : (state.credentials.length ? "" : "还没有 MiMo 凭据：在管理面板的 Auth Files 里上传 {\"type\":\"mimo\",\"api_key\":\"sk-...\"}。"));
+        : (state.credentials.length ? "模型能力来自真实请求：测速或发现模型会记录该凭据能用哪些模型，插件重载后重新发现。" : "还没有 MiMo 凭据，用上面的表单添加一个。"));
 
       const catalogBody = document.querySelector("#catalog tbody");
       catalogBody.textContent = "";
@@ -204,7 +234,7 @@
       });
     }
 
-    async function probe(authIndex, button) {
+    async function probe(row, button) {
       const original = button.textContent;
       button.disabled = true;
       button.textContent = "请求中";
@@ -212,7 +242,7 @@
         const result = await api("/probe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ auth_index: authIndex }),
+          body: JSON.stringify({ auth_index: row.auth_index, auth_id: row.id }),
         });
         button.textContent = (result.ok ? "✅ " : "❌ ") + (result.latency_ms || 0) + "ms";
         if (result.error) button.title = result.error;
@@ -221,6 +251,75 @@
         button.title = err.message;
       }
       setTimeout(function () { button.disabled = false; button.textContent = original; }, 6000);
+      refresh();
+    }
+
+    async function discover(row, button) {
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = "发现中";
+      try {
+        const result = await api("/discover", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auth_index: row.auth_index, auth_id: row.id }),
+        });
+        const entry = (result.credentials || [])[0] || {};
+        const results = entry.results || [];
+        const supported = results.filter(function (item) { return item.supported; }).length;
+        button.textContent = "✅ " + supported + "/" + results.length;
+        const rejected = results.filter(function (item) { return !item.supported && item.status; });
+        if (rejected.length) button.title = "不支持：" + rejected.map(function (item) { return item.model; }).join(", ");
+      } catch (err) {
+        button.textContent = "失败";
+        button.title = err.message;
+      }
+      setTimeout(function () { button.disabled = false; button.textContent = original; }, 8000);
+      refresh();
+    }
+
+    async function discoverAll(button) {
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = "发现中";
+      try {
+        const result = await api("/discover", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true }),
+        });
+        button.textContent = "✅ " + (result.credentials || []).length + " 条";
+      } catch (err) {
+        button.textContent = "失败";
+        button.title = err.message;
+      }
+      setTimeout(function () { button.disabled = false; button.textContent = original; }, 8000);
+      refresh();
+    }
+
+    async function addCredential() {
+      const input = document.getElementById("newKey");
+      const value = input.value.trim();
+      if (!value) {
+        text("addHint", "先填入 API key。");
+        return;
+      }
+      const button = document.getElementById("addKey");
+      button.disabled = true;
+      try {
+        const result = await api("/credentials", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_key: value, label: document.getElementById("newLabel").value.trim() }),
+        });
+        input.value = "";
+        document.getElementById("newLabel").value = "";
+        text("addHint", "已写入 " + result.name + "（" + kindLabel(result.kind) + " → " + result.url + "）。");
+      } catch (err) {
+        text("addHint", "添加失败：" + err.message);
+      }
+      button.disabled = false;
+      refresh();
     }
 
     async function refresh() {
@@ -241,6 +340,8 @@
       try { sessionStorage.setItem(KEY_STORAGE, value); } catch (_) {}
       refresh();
     });
+    document.getElementById("addKey").addEventListener("click", addCredential);
+    document.getElementById("discoverAll").addEventListener("click", function () { discoverAll(this); });
     document.getElementById("reload").addEventListener("click", refresh);
 
     key = readPanelKey();

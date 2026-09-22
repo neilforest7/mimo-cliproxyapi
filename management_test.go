@@ -94,8 +94,8 @@ func TestManagementRegisterPublishesMenuAndRoutes(t *testing.T) {
 		t.Fatalf("unexpected resource: %v", resource)
 	}
 	routes, _ := result["Routes"].([]any)
-	if len(routes) != 2 {
-		t.Fatalf("expected two routes, got %v", result["Routes"])
+	if len(routes) != 4 {
+		t.Fatalf("expected four routes, got %v", result["Routes"])
 	}
 	if !strings.Contains(renderStatusPage(), "/v0/management/plugins/mimo-cliproxyapi") {
 		t.Fatalf("page did not pick up the management base path")
@@ -237,14 +237,18 @@ func TestTokenPlanRegionConfigSelectsCluster(t *testing.T) {
 }
 
 // callManagementExecute drives one executor call so the panel has counters to show.
-func callManagementExecute(t *testing.T, host *fakeHost) (map[string]any, error) {
+func callManagementExecute(t *testing.T, host *fakeHost, apiKey ...string) (map[string]any, error) {
 	t.Helper()
+	key := "sk-test"
+	if len(apiKey) > 0 {
+		key = apiKey[0]
+	}
 	host.mu.Lock()
 	host.doResponse = pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"id":"chatcmpl-1"}`)}
 	host.mu.Unlock()
 	return callMethod(t, "executor.execute", map[string]any{
 		"AuthID":         "a1",
-		"AuthAttributes": map[string]string{"api_key": "sk-test"},
+		"AuthAttributes": map[string]string{"api_key": key},
 		"Payload":        []byte(`{"model":"mimo-v2.6-pro"}`),
 	}), nil
 }

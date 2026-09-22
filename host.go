@@ -23,6 +23,7 @@ type HostClient interface {
 	CloseDownstreamStream(streamID string, errMsg string) error
 	AuthList(ctx context.Context) ([]pluginapi.HostAuthFileEntry, error)
 	AuthGetJSON(ctx context.Context, authIndex string) (json.RawMessage, error)
+	AuthSave(ctx context.Context, name string, payload json.RawMessage) (pluginapi.HostAuthSaveResponse, error)
 	Log(level string, message string)
 }
 
@@ -188,6 +189,22 @@ func (b *HostBridge) AuthGetJSON(ctx context.Context, authIndex string) (json.Ra
 		}
 	}
 	return response.JSON, nil
+}
+
+// AuthSave persists a credential record as an auth file, so the panel can add keys
+// without the user touching the auth directory. The payload is never logged.
+func (b *HostBridge) AuthSave(ctx context.Context, name string, payload json.RawMessage) (pluginapi.HostAuthSaveResponse, error) {
+	result, err := b.invoke(ctx, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{Name: name, JSON: payload})
+	if err != nil {
+		return pluginapi.HostAuthSaveResponse{}, err
+	}
+	var response pluginapi.HostAuthSaveResponse
+	if len(result) > 0 {
+		if errUnmarshal := json.Unmarshal(result, &response); errUnmarshal != nil {
+			return pluginapi.HostAuthSaveResponse{}, fmt.Errorf("host auth save returned an undecodable body")
+		}
+	}
+	return response, nil
 }
 
 // Log forwards one diagnostic line. Messages never carry credentials or prompts.

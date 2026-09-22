@@ -10,12 +10,19 @@ import (
 // authStat is what the executor observed for one credential. It never stores the key.
 type authStat struct {
 	Kind       string
+	BaseURL    string
 	Requests   int64
 	Errors     int64
 	LastStatus int
 	LastError  string
 	LastUsed   time.Time
 }
+
+// statsRetention drops counter rows for credentials the host no longer knows about.
+const (
+	statsRetention = 24 * time.Hour
+	statsMaxRows   = 512
+)
 
 var stats = struct {
 	sync.Mutex
@@ -24,11 +31,11 @@ var stats = struct {
 	errors int64
 }{byAuth: map[string]*authStat{}}
 
-// recordRequest counts one request against a credential and remembers its key kind.
+// recordRequest counts one request against a credential and remembers where it went.
 // Requests without a credential id only move the global counters: the panel lists
 // credentials, and an empty id would show up as a phantom row.
 func recordRequest(authID string, apiKey string) {
-	id := strings.TrimSpace(authID)
+	id := normalizeCredentialID(authID)
 	stats.Lock()
 	defer stats.Unlock()
 	stats.total++
@@ -37,13 +44,14 @@ func recordRequest(authID string, apiKey string) {
 	}
 	entry := statEntryLocked(stats.byAuth, id)
 	entry.Kind = credentialKind(apiKey)
+	entry.BaseURL = baseURLForCredential(apiKey)
 	entry.Requests++
 	entry.LastUsed = time.Now()
 }
 
 // recordResult stores the upstream outcome of the most recent request.
 func recordResult(authID string, status int, errMsg string) {
-	id := strings.TrimSpace(authID)
+	id := normalizeCredentialID(authID)
 	failed := status >= 400 || errMsg != ""
 	stats.Lock()
 	defer stats.Unlock()
@@ -76,7 +84,7 @@ func statEntryLocked(byAuth map[string]*authStat, id string) *authStat {
 func statsFor(authID string) authStat {
 	stats.Lock()
 	defer stats.Unlock()
-	if entry := stats.byAuth[strings.TrimSpace(authID)]; entry != nil {
+	if entry := stats.byAuth[normalizeCredentialID(authID)]; entry != nil {
 		return *entry
 	}
 	return authStat{}
@@ -93,6 +101,34 @@ func statsTotals() (int64, int64) {
 func statsAuthIDs() []string {
 	stats.Lock()
 	defer stats.Unlock()
+	return statKeysLocked()
+}
+
+// pruneStats drops rows for credentials the host no longer lists once they have been
+// unused for statsRetention, and keeps the map bounded.
+func pruneStats(present map[string]struct{}) {
+	stats.Lock()
+	defer stats.Unlock()
+	now := time.Now()
+	for id, entry := range stats.byAuth {
+		if _, known := present[id]; known {
+			continue
+		}
+		if now.Sub(entry.LastUsed) > statsRetention {
+			delete(stats.byAuth, id)
+		}
+	}
+	if len(stats.byAuth) <= statsMaxRows {
+		return
+	}
+	ids := statKeysLocked()
+	sort.Slice(ids, func(i, j int) bool { return stats.byAuth[ids[i]].LastUsed.Before(stats.byAuth[ids[j]].LastUsed) })
+	for _, id := range ids[:len(ids)-statsMaxRows] {
+		delete(stats.byAuth, id)
+	}
+}
+
+func statKeysLocked() []string {
 	ids := make([]string, 0, len(stats.byAuth))
 	for id := range stats.byAuth {
 		if id == "" {
@@ -104,16 +140,21 @@ func statsAuthIDs() []string {
 	return ids
 }
 
-// credentialKind classifies a MiMo key without exposing it.
+// credentialKind classifies a MiMo key without exposing it. Only the documented
+// prefixes are trusted; anything else is reported as unknown so the panel can show it
+// instead of silently pretending the key is a pay-as-you-go credential.
 func credentialKind(apiKey string) string {
+	key := strings.TrimSpace(apiKey)
 	switch {
-	case strings.HasPrefix(strings.TrimSpace(apiKey), tokenPlanTeamPrefix):
-		return "token-plan-team"
-	case strings.HasPrefix(strings.TrimSpace(apiKey), tokenPlanKeyPrefix):
-		return "token-plan"
-	case apiKey == "":
+	case key == "":
 		return ""
-	default:
+	case strings.HasPrefix(key, tokenPlanTeamPrefix):
+		return "token-plan-team"
+	case strings.HasPrefix(key, tokenPlanKeyPrefix):
+		return "token-plan"
+	case strings.HasPrefix(key, payAsYouGoKeyPrefix):
 		return "pay-as-you-go"
+	default:
+		return "unknown"
 	}
 }

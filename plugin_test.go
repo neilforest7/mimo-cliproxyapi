@@ -34,6 +34,12 @@ type fakeHost struct {
 	authEntries []pluginapi.HostAuthFileEntry
 	authJSON    map[string]json.RawMessage
 	authListErr error
+
+	savedName    string
+	savedPayload json.RawMessage
+	saveErr      error
+	// doResponder overrides the canned upstream response per request body.
+	doResponder func(body []byte) pluginapi.HTTPResponse
 }
 
 func (f *fakeHost) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
@@ -42,6 +48,9 @@ func (f *fakeHost) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.H
 	f.doRequest = req
 	if f.doErr != nil {
 		return pluginapi.HTTPResponse{}, f.doErr
+	}
+	if f.doResponder != nil {
+		return f.doResponder(req.Body), nil
 	}
 	return f.doResponse, nil
 }
@@ -104,6 +113,8 @@ func resetPluginState(t *testing.T, host HostClient) {
 		t.Fatalf("configure: %v", err)
 	}
 	registerHost(host)
+	resetStatsState()
+	resetSupportState()
 }
 
 func callMethod(t *testing.T, method string, request any) map[string]any {
@@ -243,15 +254,19 @@ func TestBaseURLFollowsCredentialPlan(t *testing.T) {
 			t.Fatalf("token plan URL for %s = %q", key, got)
 		}
 	}
-	configured := `{"config_yaml":"` + toBase64("base_url: https://mirror.example/v1\ntoken_plan_base_url: https://plan.example/v1\n") + `"}`
+	// The region selects the Token Plan cluster; sk- keys keep the global host.
+	configured := `{"config_yaml":"` + toBase64("region: ams\n") + `"}`
 	if err := configure([]byte(configured)); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
-	if got := chatCompletionsURL("sk-abc"); got != "https://mirror.example/v1"+chatCompletionsPath {
-		t.Fatalf("configured URL = %q", got)
+	if got := chatCompletionsURL("tp-abc"); got != tokenPlanHostAMS+chatCompletionsPath {
+		t.Fatalf("region ams URL = %q", got)
 	}
-	if got := chatCompletionsURL("tp-abc"); got != "https://plan.example/v1"+chatCompletionsPath {
-		t.Fatalf("configured token plan URL = %q", got)
+	if got := chatCompletionsURL("ttp-abc"); got != tokenPlanHostAMS+chatCompletionsPath {
+		t.Fatalf("region ams team URL = %q", got)
+	}
+	if got := chatCompletionsURL("sk-abc"); got != payAsYouGoBaseURL+chatCompletionsPath {
+		t.Fatalf("sk- key must ignore the region: %q", got)
 	}
 }
 

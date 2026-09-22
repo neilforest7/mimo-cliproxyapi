@@ -56,10 +56,16 @@ func executeRequest(raw []byte) ([]byte, error) {
 		return errorEnvelopeStatus("upstream_unreachable", err.Error(), http.StatusBadGateway), nil
 	}
 	if response.StatusCode >= 400 {
-		recordResult(req.AuthID, response.StatusCode, upstreamErrorMessage(response.Body))
+		message := upstreamErrorMessage(response.Body)
+		recordResult(req.AuthID, response.StatusCode, message)
+		if modelNotSupported(response.Body) {
+			markModelSupport(req.AuthID, req.Model, false)
+			return errorEnvelopeStatus("model_not_supported", credentialModelMessage(req.AuthID, req.Model, message), response.StatusCode), nil
+		}
 		return upstreamErrorEnvelope(response.StatusCode, response.Body), nil
 	}
 	recordResult(req.AuthID, response.StatusCode, "")
+	markModelSupport(req.AuthID, req.Model, true)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: response.Body, Headers: response.Headers})
 }
 
@@ -98,6 +104,10 @@ func executeStreamRequest(raw []byte) ([]byte, error) {
 		message := drainStream(host, start.StreamID)
 		_ = host.CloseStream(start.StreamID)
 		recordResult(req.AuthID, start.StatusCode, message)
+		if modelNotSupported([]byte(message)) {
+			markModelSupport(req.AuthID, req.Model, false)
+			return errorEnvelopeStatus("model_not_supported", credentialModelMessage(req.AuthID, req.Model, message), start.StatusCode), nil
+		}
 		return upstreamErrorEnvelope(start.StatusCode, []byte(message)), nil
 	}
 	recordResult(req.AuthID, start.StatusCode, "")
@@ -260,6 +270,12 @@ func upstreamErrorMessage(body []byte) string {
 		}
 	}
 	return truncate(trimmed, 400)
+}
+
+// credentialModelMessage points the operator at the panel instead of a bare upstream error.
+func credentialModelMessage(authID, model, upstream string) string {
+	return fmt.Sprintf("credential %s cannot use model %s (%s); run discovery in the MiMo Provider panel",
+		strings.TrimSpace(authID), strings.TrimSpace(model), upstream)
 }
 
 func truncate(value string, limit int) string {

@@ -56,9 +56,7 @@ plugins:
     mimo-cliproxyapi:
       enabled: true
       priority: 1
-      region: cn                # cn | sgp | ams — Token Plan cluster
-      # base_url: "https://api.xiaomimimo.com/v1"
-      # token_plan_base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+      region: cn                # cn | sgp | ams — Token Plan cluster for tp-/ttp- keys
       # request_timeout_seconds: 300
       # models:
       #   - id: mimo-v2.5-pro
@@ -67,19 +65,31 @@ plugins:
       #     max_completion_tokens: 131072
 ```
 
+There is no base-URL override: `sk-` keys always use `https://api.xiaomimimo.com/v1`, and
+`tp-`/`ttp-` keys use `token-plan-<region>.xiaomimimo.com/v1`. A key with an unrecognized
+prefix is reported as `unknown` in the panel and goes to the global host, so a wrong guess is
+visible instead of silent.
+
 These fields, plus `enabled` and `priority`, render as a form in the Management Center plugin page;
 saving them goes through `PUT/PATCH /v0/management/plugins/mimo-cliproxyapi/config`.
 
-Then add one credential per API key (pay-as-you-go and token plan keys can coexist: CPA pools
-them and `auths` selection picks per request):
+### Adding keys
+
+Open the Management Center, pick the **MiMo Provider** entry in the sidebar and use the
+**新增 API Key** form. The plugin writes the credential through the host (`host.auth.save`), CPA
+picks the new auth file up on its own, and no file editing or restart is involved — the only
+changes that still need a config edit plus restart are registering the plugin and adding the store
+source.
+
+Pay-as-you-go and Token Plan keys can coexist: CPA pools them and picks per request. The
+equivalent file, if you prefer to manage credentials by hand (still no restart needed), is:
 
 ```json
 {"type": "mimo", "provider": "mimo", "id": "mimo-sk-1", "api_key": "sk-xxxxx"}
 ```
 
-Drop it in the auth directory (`auth-dir`, default `~/.cli-proxy-api`) as `mimo-sk-1.json`, or
-POST it to `/v0/management/auth-files`. Models are then reachable as `mimo-v2.6-pro` and friends
-from any client protocol CPA already serves.
+Models are then reachable as `mimo-v2.6-pro` and friends from any client protocol CPA already
+serves.
 
 ## Management Center panel
 
@@ -91,14 +101,43 @@ The plugin registers one browser resource and two API routes:
 | `GET /v0/management/plugins/mimo-cliproxyapi/state` | JSON: config, catalog, credential list, counters |
 | `POST /v0/management/plugins/mimo-cliproxyapi/probe` | one 16-token request with `{"auth_index":"..."}` to verify a credential |
 
-The panel shows the effective region and base URLs, every MiMo credential with its kind
-(`pay-as-you-go`, `token-plan`, `token-plan-team`), status, request/error counters and the last
-status, plus a per-credential probe button reporting HTTP status and latency. Credential kinds and
-counters come from what the executor observed; no key material is stored or displayed.
+What the panel does:
+
+| action | effect |
+| --- | --- |
+| **新增 API Key** | writes `<id>.json` into the auth directory through the host; kind and target URL are shown immediately |
+| **测速** | one small upstream request per credential, reporting HTTP status and latency |
+| **发现模型** / **全部发现模型** | asks the upstream, model by model, which ones this key may use |
+
+Every credential row shows its kind (`pay-as-you-go`, `token-plan`, `token-plan-team`, `unknown`),
+the base URL it targets, counters, the last status and the discovered model set. Rows merge the
+host's two listings of the same credential (file scan and runtime record), so counters never split.
+
+Model capability is learned from **real requests**: a `400` that says the model is unsupported is
+remembered for that credential, and `/discover` fills the matrix proactively. `model.for_auth` then
+hands CPA a catalog without the models that credential rejected, while the provider-wide list
+(`model.static`) stays complete. The matrix lives in memory, so a plugin reload starts discovery
+over; nothing is ever written back into your credential files.
+
+The panel routes are `GET /v0/management/plugins/mimo-cliproxyapi/state`,
+`POST .../credentials`, `POST .../probe` (optional `model`) and `POST .../discover`
+(`{"auth_index":...}` or `{"all":true}`).
 
 Resource responses are not management-authenticated, so the shell carries no data: it reads the
 management key from the panel's own storage when it runs inside the management center, or asks for
 one and keeps it in `sessionStorage`.
+
+## Deployment notes
+
+- `plugins.dir` must be an absolute, writable path: under launchd/systemd a relative path resolves
+  against `/`.
+- In Docker, bind-mount `plugins.dir` (and the auth directory) or installs and keys vanish on the
+  next container start.
+- Adding a store source or installing the plugin needs a `config.yaml` edit and a real restart
+  (`docker restart`, not a hot reload): the plugin registration runs at startup.
+- Model ids are merged across providers by CPA. If another provider already publishes the same id,
+  the host keeps one of them; the panel still lists what this plugin publishes, so a model can be
+  absent from `/v1/models` while shown here.
 
 ## Develop
 
@@ -124,7 +163,8 @@ plugin store registry.
 3. Serve the Responses API route for Codex.
 4. Token Plan credit balance in the panel, once Xiaomi publishes a usage endpoint (the console
    shows usage; no documented API yet).
-5. Audio routes (ASR/TTS) once CPA exposes them to plugins.
+5. Keep discovered model support across reloads (today it is in-memory by design).
+6. Audio routes (ASR/TTS) once CPA exposes them to plugins.
 
 ## 中文速览
 

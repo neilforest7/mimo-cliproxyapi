@@ -70,6 +70,9 @@ class FakeHost:
         self.closed_upstream: list[str] = []
         self.stream_chunk = 0
         self.status = 200
+        self.unsupported = {"mimo-v2.6-pro-ultraspeed"}
+        self.saved_name = ""
+        self.saved_payload = None
 
     def handle(self, method: str, payload: dict) -> dict:
         if method == "host.http.do":
@@ -79,6 +82,18 @@ class FakeHost:
                     "StatusCode": self.status,
                     "Headers": {"Content-Type": ["application/json"]},
                     "Body": base64.b64encode(b'{"error":{"message":"rate limited"}}').decode(),
+                }
+            request_body = base64.b64decode(payload.get("body") or "").decode() if payload.get("body") else "{}"
+            try:
+                model = json.loads(request_body).get("model", "")
+            except json.JSONDecodeError:
+                model = ""
+            if model in self.unsupported:
+                message = json.dumps({"error": {"message": "Not supported model " + model + "."}}).encode()
+                return {
+                    "StatusCode": 400,
+                    "Headers": {"Content-Type": ["application/json"]},
+                    "Body": base64.b64encode(message).decode(),
                 }
             return {
                 "StatusCode": 200,
@@ -100,12 +115,16 @@ class FakeHost:
         if method == "host.auth.list":
             return {
                 "files": [
-                    {"auth_index": "a1", "name": "mimo-sk-smoke.json", "provider": PROVIDER, "type": PROVIDER, "status": "ready"},
-                    {"auth_index": "z9", "name": "other.json", "provider": "opencode-go", "type": "opencode-go"},
+                    {"auth_index": "a1", "id": "a1", "name": "mimo-sk-smoke.json", "provider": PROVIDER, "type": PROVIDER, "status": "ready"},
+                    {"auth_index": "z9", "id": "z9", "name": "other.json", "provider": "opencode-go", "type": "opencode-go"},
                 ]
             }
+        if method == "host.auth.save":
+            self.saved_name = payload.get("name", "")
+            self.saved_payload = payload.get("json")
+            return {"name": self.saved_name, "path": "/auths/" + self.saved_name}
         if method == "host.auth.get":
-            return {"auth_index": payload.get("auth_index", ""), "json": {"type": PROVIDER, "api_key": "sk-smoke"}}
+            return {"auth_index": payload.get("auth_index", ""), "json": {"type": PROVIDER, "id": "a1", "api_key": "sk-smoke"}}
         if method == "host.stream.emit":
             self.emitted.append(base64.b64decode(payload["payload"]))
             return {}
@@ -280,8 +299,13 @@ def main() -> int:
 
         registered = call("management.register", {"BasePath": BASE_PATH, "ResourceBasePath": "/v0/resource/plugins/" + PLUGIN_ID})
         resources = registered.get("Resources") or []
+        routes = registered.get("Routes") or []
         if not resources or resources[0]["Path"] != "/status" or resources[0]["Menu"] != "MiMo Provider":
             print(f"unexpected management resources: {resources}", file=sys.stderr)
+            return 1
+        paths = sorted(route["Path"] for route in routes)
+        if paths != ["/credentials", "/discover", "/probe", "/state"]:
+            print(f"unexpected management routes: {paths}", file=sys.stderr)
             return 1
         checks += 1
 
@@ -314,12 +338,15 @@ def main() -> int:
         if status != 200 or state["provider"] != PROVIDER:
             print(f"state is wrong: {state}", file=sys.stderr)
             return 1
-        rows = {row["auth_index"]: row for row in state["credentials"]}
+        rows = {row["id"]: row for row in state["credentials"]}
         primary, runtime_only = rows.get("a1"), rows.get("a2")
         if not primary or primary["kind"] != "pay-as-you-go" or primary["requests"] < 1:
             print(f"credential counters not reported: {state['credentials']}", file=sys.stderr)
             return 1
-        if not runtime_only or runtime_only["kind"] != "token-plan":
+        if not primary.get("probe_available"):
+            print(f"host credential should be probeable: {primary}", file=sys.stderr)
+            return 1
+        if not runtime_only or runtime_only["kind"] != "token-plan" or runtime_only.get("probe_available"):
             print(f"runtime-only credential missing: {state['credentials']}", file=sys.stderr)
             return 1
         if state["totals"]["requests"] < 2 or state["totals"]["errors"] < 1:
@@ -331,6 +358,53 @@ def main() -> int:
         probe = decode(body, "probe")
         if status != 200 or not probe.get("ok") or probe.get("url") != PAY_AS_YOU_GO_URL:
             print(f"probe failed: {probe}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        status, body = manage("POST", BASE_PATH + "/credentials", json.dumps({"api_key": "sk-smoke-2", "label": "second"}).encode())
+        added = decode(body, "credentials")
+        if status != 200 or added.get("status") != "ok" or not added.get("name", "").endswith(".json"):
+            print(f"adding a credential failed: {added}", file=sys.stderr)
+            return 1
+        if added.get("kind") != "pay-as-you-go" or added.get("url") != PAY_AS_YOU_GO_URL.rsplit("/chat/completions", 1)[0]:
+            print(f"credential routing wrong: {added}", file=sys.stderr)
+            return 1
+        if "sk-smoke-2" in body.decode():
+            print("the panel echoed the key back", file=sys.stderr)
+            return 1
+        saved = host.saved_payload if isinstance(host.saved_payload, dict) else {}
+        if saved.get("api_key") != "sk-smoke-2" or saved.get("type") != PROVIDER or not saved.get("id"):
+            print(f"saved credential record is wrong: {saved}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        status, body = manage("POST", BASE_PATH + "/discover", json.dumps({"auth_index": "a1"}).encode())
+        discovery = decode(body, "discover")
+        entry = (discovery.get("credentials") or [{}])[0]
+        support = entry.get("model_support") or {}
+        if status != 200 or support.get("mimo-v2.6-pro-ultraspeed") != "unsupported" or support.get("mimo-v2.6-flash") != "supported":
+            print(f"discovery did not record model support: {discovery}", file=sys.stderr)
+            return 1
+        trimmed = call(
+            "model.for_auth",
+            {"AuthID": "a1", "StorageJSON": base64.b64encode(json.dumps({"type": PROVIDER, "id": "a1", "api_key": "sk-smoke"}).encode()).decode()},
+        )
+        ids = [model["ID"] for model in trimmed["Models"]]
+        if "mimo-v2.6-pro-ultraspeed" in ids or len(ids) != 2:
+            print(f"model.for_auth was not trimmed: {ids}", file=sys.stderr)
+            return 1
+        full = call("model.static", {})
+        if len(full["Models"]) != 3:
+            print(f"model.static must stay complete: {full}", file=sys.stderr)
+            return 1
+        checks += 1
+
+        status, body = manage("GET", BASE_PATH + "/state")
+        state = decode(body, "state")
+        rows = {row["id"]: row for row in state["credentials"]}
+        primary = rows.get("a1")
+        if not primary or primary.get("kind") != "pay-as-you-go" or primary.get("model_support", {}).get("mimo-v2.6-pro-ultraspeed") != "unsupported":
+            print(f"state lost the discovered routing: {state['credentials']}", file=sys.stderr)
             return 1
         checks += 1
 
