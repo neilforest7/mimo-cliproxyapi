@@ -235,7 +235,7 @@
       text("credentialsHint", state.credentials_error
         ? "凭据列表读取失败：" + state.credentials_error
         : (staleCount
-          ? "有 " + staleCount + " 行对应的 auth 文件已不存在（host 列表还在缓存），点"删除"清理。"
+          ? "有 " + staleCount + " 行对应的 auth 文件已不存在（host 列表还在缓存），点「删除」清理。"
           : (state.credentials.length ? "模型能力来自真实请求：测速或发现模型会记录该凭据能用哪些模型，插件重载后重新发现。" : "还没有 MiMo 凭据，用上面的表单添加一个。")));
 
       const catalogBody = document.querySelector("#catalog tbody");

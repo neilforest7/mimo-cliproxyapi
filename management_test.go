@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,6 +102,28 @@ func TestManagementRegisterPublishesMenuAndRoutes(t *testing.T) {
 	}
 	if !strings.Contains(renderStatusPage(), "/v0/management/plugins/mimo-cliproxyapi") {
 		t.Fatalf("page did not pick up the management base path")
+	}
+}
+
+// TestStatusPageInlineScriptParses catches an unescaped quote inside a JS string in the panel,
+// which breaks the whole page with a SyntaxError in the browser and nothing on the Go side.
+func TestStatusPageInlineScriptParses(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	page := renderStatusPage()
+	start := strings.Index(page, "<script>")
+	end := strings.Index(page, "</script>")
+	if start < 0 || end < start {
+		t.Fatalf("panel page has no inline script")
+	}
+	script := filepath.Join(t.TempDir(), "status.js")
+	if errWrite := os.WriteFile(script, []byte(page[start+len("<script>"):end]), 0o600); errWrite != nil {
+		t.Fatalf("write script: %v", errWrite)
+	}
+	if out, errCheck := exec.Command(node, "--check", script).CombinedOutput(); errCheck != nil {
+		t.Fatalf("inline script does not parse: %v\n%s", errCheck, out)
 	}
 }
 
